@@ -1,6 +1,6 @@
 # Beatsaver
 
-[![Build Status](https://jenkins.kirkstall.top-cat.me/buildStatus/icon?job=Main)](https://jenkins.kirkstall.top-cat.me/view/Beatsaver/job/Main/)
+[![Build Status](https://jenkins.alley.topc.at/buildStatus/icon?job=Main)](https://jenkins.alley.topc.at/view/Beatsaver/job/Main/)
 
 The main codebase for the beatsaver website.
 

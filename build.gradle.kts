@@ -24,7 +24,7 @@ allprojects {
 
     repositories {
         mavenCentral()
-        maven { url = uri("https://artifactory.kirkstall.top-cat.me") }
+        maven { url = uri("https://repo.topc.at/releases") }
     }
 
     ktlint {
