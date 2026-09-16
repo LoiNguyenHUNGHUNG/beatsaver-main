@@ -78,10 +78,14 @@ import io.beatmaps.login.MongoSession
 import io.beatmaps.login.Session
 import io.beatmaps.login.cookieName
 import io.beatmaps.login.server.DBTokenStore
+import io.beatmaps.util.IMAGE_REQUEST_TIMEOUT_MILLIS
+import io.beatmaps.util.IMAGE_RESPONSE_MAX_BYTES
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.optionalAuthorization
 import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.requireCaptcha
 import io.beatmaps.util.updateAlertCount
+import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.jsonwebtoken.Claims
 import io.jsonwebtoken.ExpiredJwtException
 import io.jsonwebtoken.Header
@@ -108,6 +112,8 @@ import io.ktor.server.routing.RoutingContext
 import io.ktor.server.sessions.get
 import io.ktor.server.sessions.sessions
 import io.ktor.server.sessions.set
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.datetime.toJavaInstant
@@ -478,6 +484,23 @@ fun UserDetail.withAccountStanding(userId: Int, showAll: Boolean = false) =
         )
     }
 
+private val userPlaylistSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val registrationSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val forgotPasswordSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val emailChangeSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
+@NetworkDownload(
+    maxBytes = IMAGE_RESPONSE_MAX_BYTES,
+    completeTimeoutMillis = IMAGE_REQUEST_TIMEOUT_MILLIS
+)
+private suspend fun downloadPlaylistAvatar(client: HttpClient, url: String) =
+    client.get(url) {
+        timeout {
+            socketTimeoutMillis = 30000
+            requestTimeoutMillis = IMAGE_REQUEST_TIMEOUT_MILLIS
+        }
+    }.body<ByteArray>()
+
 fun Route.userRoute(client: HttpClient) {
     val usernameRegex = Regex("^[._\\-A-Za-z0-9]{3,50}$")
     post<UsersApi.Username> {
@@ -688,78 +711,80 @@ fun Route.userRoute(client: HttpClient) {
     post<UsersApi.Register> {
         val req = call.receive<RegisterRequest>()
 
-        val response = requireCaptcha(
-            client,
-            req.captcha,
-            {
-                if (req.password != req.password2) {
-                    ActionResponse.error("Passwords don't match")
-                } else if (req.password.length < 8) {
-                    ActionResponse.error("Password too short")
-                } else if (!usernameRegex.matches(req.username)) {
-                    ActionResponse.error("Username not valid")
-                } else {
-                    try {
-                        val bcrypt = String(Bcrypt.hash(req.password, 12))
+        val response = registrationSlots.withPermit {
+            requireCaptcha(
+                client,
+                req.captcha,
+                {
+                    if (req.password != req.password2) {
+                        ActionResponse.error("Passwords don't match")
+                    } else if (req.password.length < 8) {
+                        ActionResponse.error("Password too short")
+                    } else if (!usernameRegex.matches(req.username)) {
+                        ActionResponse.error("Username not valid")
+                    } else {
+                        try {
+                            val bcrypt = String(Bcrypt.hash(req.password, 12))
 
-                        val newUserId = transaction {
-                            try {
-                                User.insertAndGetId {
-                                    it[name] = req.username
-                                    it[email] = req.email
-                                    it[password] = bcrypt
-                                    it[verifyToken] = "pending"
-                                    it[uniqueName] = req.username
-                                    it[active] = false
-                                } to null
-                            } catch (e: ExposedSQLException) {
-                                if (e.message?.contains("simple_username") == true) {
-                                    // Username constraint -> show conflict error
-                                    null to ActionResponse.error("Username taken")
-                                } else if (e.message?.contains("uploader_pkey") == true) {
-                                    // id constraint, retry transaction
-                                    throw e
-                                } else {
-                                    // Email constraint -> show success message / check your email
-                                    null to null
+                            val newUserId = transaction {
+                                try {
+                                    User.insertAndGetId {
+                                        it[name] = req.username
+                                        it[email] = req.email
+                                        it[password] = bcrypt
+                                        it[verifyToken] = "pending"
+                                        it[uniqueName] = req.username
+                                        it[active] = false
+                                    } to null
+                                } catch (e: ExposedSQLException) {
+                                    if (e.message?.contains("simple_username") == true) {
+                                        // Username constraint -> show conflict error
+                                        null to ActionResponse.error("Username taken")
+                                    } else if (e.message?.contains("uploader_pkey") == true) {
+                                        // id constraint, retry transaction
+                                        throw e
+                                    } else {
+                                        // Email constraint -> show success message / check your email
+                                        null to null
+                                    }
                                 }
                             }
+
+                            // Complicated series of fallbacks. If the id is set we created a news user, send them an email. If a response is set send it.
+                            // Otherwise the email was a duplicate, tell the user via email so we don't reveal which emails have been registered already.
+                            newUserId.first?.let {
+                                val jwt = Jwts.builder()
+                                    .setExpiration(30.days)
+                                    .setSubject(it.value.toString())
+                                    .claim("action", "register")
+                                    .signWith(UserCrypto.key())
+                                    .compact()
+
+                                sendEmail(
+                                    req.email,
+                                    "BeatSaver Account Verification",
+                                    "${req.username}\n\nTo verify your account, please click the link below:\n${Config.siteBase()}/verify/$jwt"
+                                )
+
+                                ActionResponse.success()
+                            } ?: newUserId.second ?: run {
+                                sendEmail(
+                                    req.email,
+                                    "BeatSaver Account",
+                                    "Someone just tried to create a new account at ${Config.siteBase()} with this email address but an account using this email already exists.\n\n" +
+                                        "If this wasn't you then you can safely ignore this email otherwise please use a different email"
+                                )
+
+                                ActionResponse.success()
+                            }
+                        } catch (_: IllegalArgumentException) {
+                            ActionResponse.error("Password too long")
                         }
-
-                        // Complicated series of fallbacks. If the id is set we created a news user, send them an email. If a response is set send it.
-                        // Otherwise the email was a duplicate, tell the user via email so we don't reveal which emails have been registered already.
-                        newUserId.first?.let {
-                            val jwt = Jwts.builder()
-                                .setExpiration(30.days)
-                                .setSubject(it.value.toString())
-                                .claim("action", "register")
-                                .signWith(UserCrypto.key())
-                                .compact()
-
-                            sendEmail(
-                                req.email,
-                                "BeatSaver Account Verification",
-                                "${req.username}\n\nTo verify your account, please click the link below:\n${Config.siteBase()}/verify/$jwt"
-                            )
-
-                            ActionResponse.success()
-                        } ?: newUserId.second ?: run {
-                            sendEmail(
-                                req.email,
-                                "BeatSaver Account",
-                                "Someone just tried to create a new account at ${Config.siteBase()} with this email address but an account using this email already exists.\n\n" +
-                                    "If this wasn't you then you can safely ignore this email otherwise please use a different email"
-                            )
-
-                            ActionResponse.success()
-                        }
-                    } catch (_: IllegalArgumentException) {
-                        ActionResponse.error("Password too long")
                     }
                 }
+            ) {
+                it.toActionResponse()
             }
-        ) {
-            it.toActionResponse()
         }
 
         call.respond(response)
@@ -768,34 +793,36 @@ fun Route.userRoute(client: HttpClient) {
     post<UsersApi.Forgot> {
         val req = call.receive<ForgotRequest>()
 
-        val response = requireCaptcha(
-            client,
-            req.captcha,
-            {
-                transaction {
-                    User.selectAll().where {
-                        (User.email eq req.email) and User.password.isNotNull() and (User.active or User.verifyToken.isNotNull())
-                    }.firstOrNull()?.let { UserDao.wrapRow(it) }
-                }?.let { user ->
-                    val jwt = Jwts.builder()
-                        .setExpiration(20.minutes)
-                        .setSubject(user.id.toString())
-                        .claim("action", "reset")
-                        .signWith(UserCrypto.keyForUser(user))
-                        .compact()
+        val response = forgotPasswordSlots.withPermit {
+            requireCaptcha(
+                client,
+                req.captcha,
+                {
+                    transaction {
+                        User.selectAll().where {
+                            (User.email eq req.email) and User.password.isNotNull() and (User.active or User.verifyToken.isNotNull())
+                        }.firstOrNull()?.let { UserDao.wrapRow(it) }
+                    }?.let { user ->
+                        val jwt = Jwts.builder()
+                            .setExpiration(20.minutes)
+                            .setSubject(user.id.toString())
+                            .claim("action", "reset")
+                            .signWith(UserCrypto.keyForUser(user))
+                            .compact()
 
-                    sendEmail(
-                        req.email,
-                        "BeatSaver Password Reset",
-                        "You can reset your password for the account `${user.uniqueName}` by clicking here: ${Config.siteBase()}/reset/$jwt\n\n" +
-                            "If this wasn't you then you can safely ignore this email."
-                    )
+                        sendEmail(
+                            req.email,
+                            "BeatSaver Password Reset",
+                            "You can reset your password for the account `${user.uniqueName}` by clicking here: ${Config.siteBase()}/reset/$jwt\n\n" +
+                                "If this wasn't you then you can safely ignore this email."
+                        )
+                    }
+
+                    ActionResponse.success()
                 }
-
-                ActionResponse.success()
+            ) {
+                it.toActionResponse()
             }
-        ) {
-            it.toActionResponse()
         }
 
         call.respond(response)
@@ -923,39 +950,41 @@ fun Route.userRoute(client: HttpClient) {
         requireAuthorization { _, sess ->
             val req = call.receive<EmailRequest>()
 
-            val response = requireCaptcha(
-                client,
-                req.captcha,
-                {
-                    newSuspendedTransaction {
-                        User.selectAll().where {
-                            (User.id eq sess.userId)
-                        }.firstOrNull()?.let { UserDao.wrapRow(it) }
-                    }?.let { user ->
-                        if (user.emailChangedAt.toKotlinInstant() > Clock.System.now().minus(10.days)) {
-                            ActionResponse.error("You can only change email once every 10 days")
-                        } else {
-                            val jwt = Jwts.builder()
-                                .setExpiration(20.minutes)
-                                .setSubject(user.id.toString())
-                                .claim("email", req.email)
-                                .claim("action", "email")
-                                .signWith(UserCrypto.key())
-                                .compact()
+            val response = emailChangeSlots.withPermit {
+                requireCaptcha(
+                    client,
+                    req.captcha,
+                    {
+                        newSuspendedTransaction {
+                            User.selectAll().where {
+                                (User.id eq sess.userId)
+                            }.firstOrNull()?.let { UserDao.wrapRow(it) }
+                        }?.let { user ->
+                            if (user.emailChangedAt.toKotlinInstant() > Clock.System.now().minus(10.days)) {
+                                ActionResponse.error("You can only change email once every 10 days")
+                            } else {
+                                val jwt = Jwts.builder()
+                                    .setExpiration(20.minutes)
+                                    .setSubject(user.id.toString())
+                                    .claim("email", req.email)
+                                    .claim("action", "email")
+                                    .signWith(UserCrypto.key())
+                                    .compact()
 
-                            sendEmail(
-                                req.email,
-                                "BeatSaver Email Change",
-                                "Hi ${user.uniqueName},\n\n" +
-                                    "You can update the email on your account by clicking here: ${Config.siteBase()}/change-email/$jwt"
-                            )
+                                sendEmail(
+                                    req.email,
+                                    "BeatSaver Email Change",
+                                    "Hi ${user.uniqueName},\n\n" +
+                                        "You can update the email on your account by clicking here: ${Config.siteBase()}/change-email/$jwt"
+                                )
 
-                            ActionResponse.success()
-                        }
-                    } ?: ActionResponse.error("User not found")
+                                ActionResponse.success()
+                            }
+                        } ?: ActionResponse.error("User not found")
+                    }
+                ) {
+                    it.toActionResponse()
                 }
-            ) {
-                it.toActionResponse()
             }
 
             call.respond(if (response.success) HttpStatusCode.OK else HttpStatusCode.BadRequest, response)
@@ -1325,12 +1354,9 @@ fun Route.userRoute(client: HttpClient) {
         }
 
         val imageStr = Base64.getEncoder().encodeToString(
-            client.get(user.avatar) {
-                timeout {
-                    socketTimeoutMillis = 30000
-                    requestTimeoutMillis = 60000
-                }
-            }.body<ByteArray>()
+            userPlaylistSlots.withPermit {
+                downloadPlaylistAvatar(client, user.avatar)
+            }
         )
 
         val dateStr = formatter.format(LocalDateTime.now())

@@ -42,6 +42,7 @@ import io.beatmaps.common.dbo.reviewerAlias
 import io.beatmaps.common.or
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.captchaIfPresent
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.requireAuthorization
@@ -57,6 +58,8 @@ import io.ktor.server.resources.post
 import io.ktor.server.resources.put
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Instant
 import kotlinx.datetime.toJavaInstant
 import kotlinx.datetime.toKotlinInstant
@@ -259,6 +262,10 @@ fun Query.complexToReview() = this.fold(mutableMapOf<EntityID<Int>, ReviewDao>()
     }
 }.values.toList()
 
+private val reviewUpdateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val replyCreateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val replyUpdateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun Route.reviewRoute(client: HttpClient) {
     get<ReviewApi.ByDate> {
         val reviews = transaction {
@@ -452,102 +459,104 @@ fun Route.reviewRoute(client: HttpClient) {
                 return@requireAuthorization
             }
 
-            captchaIfPresent(client, update.captcha) {
-                val success = newSuspendedTransaction {
-                    if (reqUid != sess.userId && !sess.isCurator()) {
-                        call.respond(HttpStatusCode.Forbidden, ActionResponse.error())
-                        return@newSuspendedTransaction false
-                    }
-
-                    if (isSuspended(sess.userId, SuspensionType.Review)) {
-                        // User is suspended
-                        throw UserApiException("You are currently silenced and cannot review maps or reply to reviews.")
-                    }
-
-                    val oldData = if (reqUid != sess.userId) {
-                        ReviewDao.wrapRow(Review.selectAll().where { Review.mapId eq updateMapId and (Review.userId eq reqUid) and Review.deletedAt.isNull() }.single())
-                    } else {
-                        null
-                    }
-
-                    if (update.captcha == null) {
-                        Review.update({ Review.mapId eq updateMapId and (Review.userId eq reqUid) and Review.deletedAt.isNull() }) { r ->
-                            r[updatedAt] = NowExpression(updatedAt)
-                            r[text] = newText
-                            r[sentiment] = update.sentiment.dbValue
-                        }
-                    } else {
-                        val map = Beatmap.joinUploader().joinCollaborators().selectAll().where {
-                            Beatmap.id eq updateMapId
-                        }.complexToBeatmap().single()
-
-                        if (map.uploaderId.value == reqUid) {
-                            // Can't review your own map
-                            throw UserApiException("Own map")
+            reviewUpdateSlots.withPermit {
+                captchaIfPresent(client, update.captcha) {
+                    val success = newSuspendedTransaction {
+                        if (reqUid != sess.userId && !sess.isCurator()) {
+                            call.respond(HttpStatusCode.Forbidden, ActionResponse.error())
+                            return@newSuspendedTransaction false
                         }
 
-                        val isCollaborator = map.collaborators.values.any { singleCollaborator ->
-                            singleCollaborator.id.value == reqUid
+                        if (isSuspended(sess.userId, SuspensionType.Review)) {
+                            // User is suspended
+                            throw UserApiException("You are currently silenced and cannot review maps or reply to reviews.")
                         }
 
-                        if (isCollaborator) {
-                            // Can't review maps that you collaborated on
-                            throw UserApiException("You're a collaborator of this map")
+                        val oldData = if (reqUid != sess.userId) {
+                            ReviewDao.wrapRow(Review.selectAll().where { Review.mapId eq updateMapId and (Review.userId eq reqUid) and Review.deletedAt.isNull() }.single())
+                        } else {
+                            null
                         }
 
-                        Review.upsert(conflictIndex = Index(listOf(Review.mapId, Review.userId), true, "review_unique")) { r ->
-                            r[mapId] = updateMapId
-                            r[userId] = reqUid
-                            r[text] = newText
-                            r[sentiment] = update.sentiment.dbValue
-                            r[createdAt] = NowExpression(createdAt)
-                            r[updatedAt] = NowExpression(updatedAt)
-                            r[deletedAt] = null
+                        if (update.captcha == null) {
+                            Review.update({ Review.mapId eq updateMapId and (Review.userId eq reqUid) and Review.deletedAt.isNull() }) { r ->
+                                r[updatedAt] = NowExpression(updatedAt)
+                                r[text] = newText
+                                r[sentiment] = update.sentiment.dbValue
+                            }
+                        } else {
+                            val map = Beatmap.joinUploader().joinCollaborators().selectAll().where {
+                                Beatmap.id eq updateMapId
+                            }.complexToBeatmap().single()
+
+                            if (map.uploaderId.value == reqUid) {
+                                // Can't review your own map
+                                throw UserApiException("Own map")
+                            }
+
+                            val isCollaborator = map.collaborators.values.any { singleCollaborator ->
+                                singleCollaborator.id.value == reqUid
+                            }
+
+                            if (isCollaborator) {
+                                // Can't review maps that you collaborated on
+                                throw UserApiException("You're a collaborator of this map")
+                            }
+
+                            Review.upsert(conflictIndex = Index(listOf(Review.mapId, Review.userId), true, "review_unique")) { r ->
+                                r[mapId] = updateMapId
+                                r[userId] = reqUid
+                                r[text] = newText
+                                r[sentiment] = update.sentiment.dbValue
+                                r[createdAt] = NowExpression(createdAt)
+                                r[updatedAt] = NowExpression(updatedAt)
+                                r[deletedAt] = null
+                            }
+
+                            val alertDescription = Alert.forDescription(newText)
+                            if (map.uploader.reviewAlerts) {
+                                Alert.insert(
+                                    "New review on your map",
+                                    "@${sess.uniqueName} just reviewed your map #${toHexString(updateMapId)}: **${map.name}**.\n" +
+                                        "*\"$alertDescription\"*",
+                                    EAlertType.Review,
+                                    map.uploaderId.value
+                                )
+                                updateAlertCount(map.uploaderId.value)
+                            }
+
+                            val collaboratorIdsToNotify = map.collaborators.values.filter { it.reviewAlerts }.map { it.id.value }
+
+                            if (collaboratorIdsToNotify.isNotEmpty()) {
+                                Alert.insert(
+                                    "New review on a map you collaborated on",
+                                    "@${sess.uniqueName} just reviewed a map you collaborated on #${toHexString(updateMapId)}: **${map.name}**.\n" +
+                                        "*\"$alertDescription\"*",
+                                    EAlertType.Review,
+                                    collaboratorIdsToNotify
+                                )
+
+                                updateAlertCount(collaboratorIdsToNotify)
+                            }
                         }
 
-                        val alertDescription = Alert.forDescription(newText)
-                        if (map.uploader.reviewAlerts) {
-                            Alert.insert(
-                                "New review on your map",
-                                "@${sess.uniqueName} just reviewed your map #${toHexString(updateMapId)}: **${map.name}**.\n" +
-                                    "*\"$alertDescription\"*",
-                                EAlertType.Review,
-                                map.uploaderId.value
+                        if (reqUid != sess.userId && oldData != null) {
+                            ModLog.insert(
+                                sess.userId,
+                                updateMapId,
+                                ReviewModerationData(oldData.sentiment, update.sentiment.dbValue, oldData.text, newText),
+                                reqUid
                             )
-                            updateAlertCount(map.uploaderId.value)
                         }
 
-                        val collaboratorIdsToNotify = map.collaborators.values.filter { it.reviewAlerts }.map { it.id.value }
-
-                        if (collaboratorIdsToNotify.isNotEmpty()) {
-                            Alert.insert(
-                                "New review on a map you collaborated on",
-                                "@${sess.uniqueName} just reviewed a map you collaborated on #${toHexString(updateMapId)}: **${map.name}**.\n" +
-                                    "*\"$alertDescription\"*",
-                                EAlertType.Review,
-                                collaboratorIdsToNotify
-                            )
-
-                            updateAlertCount(collaboratorIdsToNotify)
-                        }
+                        true
                     }
 
-                    if (reqUid != sess.userId && oldData != null) {
-                        ModLog.insert(
-                            sess.userId,
-                            updateMapId,
-                            ReviewModerationData(oldData.sentiment, update.sentiment.dbValue, oldData.text, newText),
-                            reqUid
-                        )
+                    if (success) {
+                        val updateType = if (update.captcha == null) "updated" else "created"
+                        call.pub("beatmaps", "reviews.$updateMapId.$updateType", null, ReviewUpdateInfo(updateMapId, reqUid))
+                        call.respond(ActionResponse.success())
                     }
-
-                    true
-                }
-
-                if (success) {
-                    val updateType = if (update.captcha == null) "updated" else "created"
-                    call.pub("beatmaps", "reviews.$updateMapId.$updateType", null, ReviewUpdateInfo(updateMapId, reqUid))
-                    call.respond(ActionResponse.success())
                 }
             }
         }
@@ -639,102 +648,104 @@ fun Route.reviewRoute(client: HttpClient) {
             if (reply.captcha == null) throw UserApiException("Missing Captcha")
             val reviewId = req.reviewId?.orNull() ?: throw UserApiException("Review id missing")
 
-            val response = requireCaptcha(
-                client,
-                reply.captcha,
-                {
-                    val (insertedId, response) = newSuspendedTransaction {
-                        if (isSuspended(user.userId, SuspensionType.Review)) throw UserApiException("You are currently silenced and cannot review maps or reply to reviews.")
+            val response = replyCreateSlots.withPermit {
+                requireCaptcha(
+                    client,
+                    reply.captcha,
+                    {
+                        val (insertedId, response) = newSuspendedTransaction {
+                            if (isSuspended(user.userId, SuspensionType.Review)) throw UserApiException("You are currently silenced and cannot review maps or reply to reviews.")
 
-                        val intermediaryResult = Review
-                            .join(Beatmap, JoinType.LEFT, Review.mapId, Beatmap.id)
-                            .joinUser(Beatmap.uploader)
-                            .select(Review.userId, Beatmap.id, Beatmap.name, Beatmap.uploader, User.reviewAlerts)
-                            .where { Review.id eq reviewId and Beatmap.deletedAt.isNull() and Review.deletedAt.isNull() }
-                            .firstOrNull()
+                            val intermediaryResult = Review
+                                .join(Beatmap, JoinType.LEFT, Review.mapId, Beatmap.id)
+                                .joinUser(Beatmap.uploader)
+                                .select(Review.userId, Beatmap.id, Beatmap.name, Beatmap.uploader, User.reviewAlerts)
+                                .where { Review.id eq reviewId and Beatmap.deletedAt.isNull() and Review.deletedAt.isNull() }
+                                .firstOrNull()
 
-                        if (intermediaryResult == null) {
-                            return@newSuspendedTransaction Pair(
-                                null,
-                                ActionResponse.error("Review or map not found")
-                            )
-                        }
+                            if (intermediaryResult == null) {
+                                return@newSuspendedTransaction Pair(
+                                    null,
+                                    ActionResponse.error("Review or map not found")
+                                )
+                            }
 
-                        val reviewUserId = intermediaryResult[Review.userId].value
-                        val mapId = intermediaryResult[Beatmap.id].value
-                        val mapName = intermediaryResult[Beatmap.name]
-                        val uploadUserId = intermediaryResult[Beatmap.uploader].value
-                        val uploaderAlerts = intermediaryResult[User.reviewAlerts]
+                            val reviewUserId = intermediaryResult[Review.userId].value
+                            val mapId = intermediaryResult[Beatmap.id].value
+                            val mapName = intermediaryResult[Beatmap.name]
+                            val uploadUserId = intermediaryResult[Beatmap.uploader].value
+                            val uploaderAlerts = intermediaryResult[User.reviewAlerts]
 
-                        val collaborators = Collaboration
-                            .joinUser(Collaboration.collaboratorId)
-                            .select(Collaboration.collaboratorId, User.reviewAlerts)
-                            .where { Collaboration.mapId eq mapId and Collaboration.accepted }
+                            val collaborators = Collaboration
+                                .joinUser(Collaboration.collaboratorId)
+                                .select(Collaboration.collaboratorId, User.reviewAlerts)
+                                .where { Collaboration.mapId eq mapId and Collaboration.accepted }
 
-                        val allowedUsers = listOf(
-                            uploadUserId,
-                            *collaborators.map { it[Collaboration.collaboratorId].value }.toTypedArray(),
-                            reviewUserId
-                        )
-
-                        if (user.userId !in allowedUsers) {
-                            return@newSuspendedTransaction Pair(null, ActionResponse.error("Unauthorised"))
-                        }
-
-                        val insertedId = ReviewReply.insertAndGetId {
-                            it[userId] = user.userId
-                            it[this.reviewId] = reviewId
-                            it[text] = reply.text
-                            it[createdAt] = NowExpression(createdAt)
-                            it[updatedAt] = NowExpression(updatedAt)
-                        }.value
-
-                        val alertHeader = "New Review Reply"
-                        val alertDescription = Alert.forDescription(reply.text)
-
-                        if (user.userId != reviewUserId) {
-                            Alert.insert(
-                                alertHeader,
-                                "@${user.uniqueName} just replied to your review on #${toHexString(mapId)}: **$mapName**.\n" +
-                                    "*\"$alertDescription\"*",
-                                EAlertType.ReviewReply,
+                            val allowedUsers = listOf(
+                                uploadUserId,
+                                *collaborators.map { it[Collaboration.collaboratorId].value }.toTypedArray(),
                                 reviewUserId
                             )
 
-                            updateAlertCount(reviewUserId)
+                            if (user.userId !in allowedUsers) {
+                                return@newSuspendedTransaction Pair(null, ActionResponse.error("Unauthorised"))
+                            }
+
+                            val insertedId = ReviewReply.insertAndGetId {
+                                it[userId] = user.userId
+                                it[this.reviewId] = reviewId
+                                it[text] = reply.text
+                                it[createdAt] = NowExpression(createdAt)
+                                it[updatedAt] = NowExpression(updatedAt)
+                            }.value
+
+                            val alertHeader = "New Review Reply"
+                            val alertDescription = Alert.forDescription(reply.text)
+
+                            if (user.userId != reviewUserId) {
+                                Alert.insert(
+                                    alertHeader,
+                                    "@${user.uniqueName} just replied to your review on #${toHexString(mapId)}: **$mapName**.\n" +
+                                        "*\"$alertDescription\"*",
+                                    EAlertType.ReviewReply,
+                                    reviewUserId
+                                )
+
+                                updateAlertCount(reviewUserId)
+                            }
+
+                            val collaboratorIdsToNotify = collaborators.filter {
+                                it[Collaboration.collaboratorId].value != user.userId &&
+                                    it[User.reviewAlerts]
+                            }.map { it[Collaboration.collaboratorId].value }.let {
+                                // Also notify uploader
+                                if (uploaderAlerts && user.userId != uploadUserId) it.plus(uploadUserId) else it
+                            }
+
+                            if (collaboratorIdsToNotify.isNotEmpty()) {
+                                Alert.insert(
+                                    alertHeader,
+                                    "@${user.uniqueName} just replied to a review on #${toHexString(mapId)}: **$mapName**.\n" +
+                                        "*\"$alertDescription\"*",
+                                    EAlertType.ReviewReply,
+                                    collaboratorIdsToNotify
+                                )
+
+                                updateAlertCount(collaboratorIdsToNotify)
+                            }
+
+                            Pair(insertedId, ActionResponse.success())
                         }
 
-                        val collaboratorIdsToNotify = collaborators.filter {
-                            it[Collaboration.collaboratorId].value != user.userId &&
-                                it[User.reviewAlerts]
-                        }.map { it[Collaboration.collaboratorId].value }.let {
-                            // Also notify uploader
-                            if (uploaderAlerts && user.userId != uploadUserId) it.plus(uploadUserId) else it
+                        if (insertedId != null) {
+                            call.pub("beatmaps", "ws.review-replies.created", null, insertedId)
                         }
 
-                        if (collaboratorIdsToNotify.isNotEmpty()) {
-                            Alert.insert(
-                                alertHeader,
-                                "@${user.uniqueName} just replied to a review on #${toHexString(mapId)}: **$mapName**.\n" +
-                                    "*\"$alertDescription\"*",
-                                EAlertType.ReviewReply,
-                                collaboratorIdsToNotify
-                            )
-
-                            updateAlertCount(collaboratorIdsToNotify)
-                        }
-
-                        Pair(insertedId, ActionResponse.success())
+                        response
                     }
-
-                    if (insertedId != null) {
-                        call.pub("beatmaps", "ws.review-replies.created", null, insertedId)
-                    }
-
-                    response
+                ) { e ->
+                    e.toActionResponse()
                 }
-            ) { e ->
-                e.toActionResponse()
             }
 
             call.respond(if (response.success) HttpStatusCode.OK else HttpStatusCode.BadRequest, response)
@@ -746,54 +757,56 @@ fun Route.reviewRoute(client: HttpClient) {
             val update = call.receive<ReplyRequest>()
             val replyId = req.replyId?.orNull() ?: throw UserApiException("Reply id missing")
 
-            captchaIfPresent(client, update.captcha) {
-                val response = newSuspendedTransaction {
-                    if (isSuspended(user.userId, SuspensionType.Review)) throw UserApiException("You are currently silenced and cannot review maps or reply to reviews.")
+            replyUpdateSlots.withPermit {
+                captchaIfPresent(client, update.captcha) {
+                    val response = newSuspendedTransaction {
+                        if (isSuspended(user.userId, SuspensionType.Review)) throw UserApiException("You are currently silenced and cannot review maps or reply to reviews.")
 
-                    val ownerId = ReviewReply
-                        .select(ReviewReply.userId)
-                        .where { ReviewReply.id eq replyId }
-                        .single().let { it[ReviewReply.userId].value }
-
-                    if (ownerId != user.userId && !user.isCurator()) {
-                        return@newSuspendedTransaction ActionResponse.error("Unauthorised")
-                    }
-
-                    val oldData = if (ownerId != user.userId) {
-                        ReviewReplyDao.wrapRow(ReviewReply.selectAll().where { ReviewReply.id eq replyId and ReviewReply.deletedAt.isNull() }.single())
-                    } else {
-                        null
-                    }
-
-                    val updated = ReviewReply.update({ ReviewReply.id eq replyId and ReviewReply.deletedAt.isNull() }) {
-                        it[text] = update.text
-                        it[updatedAt] = NowExpression(updatedAt)
-                    } > 0
-
-                    if (updated && ownerId != user.userId && oldData != null) {
-                        val (mapId, userId) = ReviewReply
-                            .join(Review, JoinType.INNER, ReviewReply.reviewId, Review.id)
-                            .select(Review.mapId, ReviewReply.userId)
+                        val ownerId = ReviewReply
+                            .select(ReviewReply.userId)
                             .where { ReviewReply.id eq replyId }
-                            .single().let { it[Review.mapId].value to it[ReviewReply.userId].value }
+                            .single().let { it[ReviewReply.userId].value }
 
-                        ModLog.insert(
-                            user.userId,
-                            mapId,
-                            ReplyModerationData(oldData.text, update.text),
-                            userId
-                        )
+                        if (ownerId != user.userId && !user.isCurator()) {
+                            return@newSuspendedTransaction ActionResponse.error("Unauthorised")
+                        }
+
+                        val oldData = if (ownerId != user.userId) {
+                            ReviewReplyDao.wrapRow(ReviewReply.selectAll().where { ReviewReply.id eq replyId and ReviewReply.deletedAt.isNull() }.single())
+                        } else {
+                            null
+                        }
+
+                        val updated = ReviewReply.update({ ReviewReply.id eq replyId and ReviewReply.deletedAt.isNull() }) {
+                            it[text] = update.text
+                            it[updatedAt] = NowExpression(updatedAt)
+                        } > 0
+
+                        if (updated && ownerId != user.userId && oldData != null) {
+                            val (mapId, userId) = ReviewReply
+                                .join(Review, JoinType.INNER, ReviewReply.reviewId, Review.id)
+                                .select(Review.mapId, ReviewReply.userId)
+                                .where { ReviewReply.id eq replyId }
+                                .single().let { it[Review.mapId].value to it[ReviewReply.userId].value }
+
+                            ModLog.insert(
+                                user.userId,
+                                mapId,
+                                ReplyModerationData(oldData.text, update.text),
+                                userId
+                            )
+                        }
+
+                        if (updated) ActionResponse.success() else ActionResponse.error()
                     }
 
-                    if (updated) ActionResponse.success() else ActionResponse.error()
-                }
+                    // This should be outside the transaction - otherwise the websocket will send the old text
+                    if (response.success) {
+                        call.pub("beatmaps", "ws.review-replies.updated", null, replyId)
+                    }
 
-                // This should be outside the transaction - otherwise the websocket will send the old text
-                if (response.success) {
-                    call.pub("beatmaps", "ws.review-replies.updated", null, replyId)
+                    call.respond(response)
                 }
-
-                call.respond(response)
             }
         }
     }

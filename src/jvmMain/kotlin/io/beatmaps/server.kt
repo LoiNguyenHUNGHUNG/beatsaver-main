@@ -70,6 +70,7 @@ import io.beatmaps.util.downloadsThread
 import io.beatmaps.util.playlistStats
 import io.beatmaps.util.reviewListeners
 import io.beatmaps.websockets.mapUpdateEnricher
+import io.github.loinguyen.bandwidth.annotations.EntryPoint
 import io.ktor.client.HttpClient
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -193,6 +194,7 @@ fun migrateDB(ds: DataSource, type: DbMigrationType) {
         .migrate()
 }
 
+@EntryPoint
 fun Application.beatmapsio(httpClient: HttpClient = jsonClient) {
     install(ContentNegotiation) {
         val kotlinx = KotlinxSerializationConverter(json)

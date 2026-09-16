@@ -10,8 +10,11 @@ import io.beatmaps.common.dbo.Versions
 import io.beatmaps.common.dbo.VersionsDao
 import io.beatmaps.common.util.CDNUpdate
 import io.beatmaps.common.util.downloadFilename
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.ktor.client.HttpClient
 import io.ktor.server.application.Application
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.or
@@ -32,6 +35,7 @@ val cloudflareR2Secret = System.getenv("CF_R2_SECRET") ?: ""
 val cloudflareR2Bucket = System.getenv("CF_R2_BUCKET") ?: "beatsaver"
 
 private val logger = Logger.getLogger("bmio.Cloudflare")
+private val filenameUpdateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun <K, V> createLRUMap(maxEntries: Int): MutableMap<K, V> {
     return object : LinkedHashMap<K, V>(maxEntries * 10 / 7, 0.7f, true) {
@@ -54,16 +58,18 @@ fun Application.filenameUpdater(client: HttpClient) {
 
     rabbitOptional {
         consumeAck("cdn.r2", CDNUpdate::class) { _, update ->
-            // Ignore test maps
-            if (update.hash?.contains(" ") == true) return@consumeAck
+            filenameUpdateSlots.withPermit {
+                // Ignore test maps
+                if (update.hash?.contains(" ") == true) return@consumeAck
 
-            deleteFromR2(update, r2Client)
+                deleteFromR2(update, r2Client)
 
-            if (update.deleted) return@consumeAck
-            val hash = update.hash ?: return@consumeAck
+                if (update.deleted) return@consumeAck
+                val hash = update.hash ?: return@consumeAck
 
-            updateDownloadFilename(update, beatsaverKVStore, hash, downloadFilenameCache)
-            if (cloudflareR2Enabled) uploadToR2(update, r2Client)
+                updateDownloadFilename(update, beatsaverKVStore, hash, downloadFilenameCache)
+                if (cloudflareR2Enabled) uploadToR2(update, r2Client)
+            }
         }
     }
 }

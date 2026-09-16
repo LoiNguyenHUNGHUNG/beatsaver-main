@@ -22,6 +22,7 @@ import io.beatmaps.controllers.upload.Upload
 import io.beatmaps.controllers.upload.initValidation
 import io.beatmaps.controllers.upload.validateFiles
 import io.beatmaps.genericPage
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.handleMultipart
 import io.beatmaps.util.requireAuthorization
 import io.ktor.client.HttpClient
@@ -32,6 +33,8 @@ import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.utils.io.jvm.javaio.toInputStream
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
@@ -72,6 +75,9 @@ fun userWipCount(userId: Int) = Beatmap
         Beatmap.uploader eq userId and Beatmap.deletedAt.isNull() and Versions.id.isNull()
     }.count()
 
+private val avatarUploadSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapUploadSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun Route.uploadController(client: HttpClient) {
     get<UploadMap> {
         genericPage()
@@ -83,20 +89,22 @@ fun Route.uploadController(client: HttpClient) {
                 val filename = "${sess.userId}.jpg"
                 val localFile = File(Folders.localAvatarFolder(), filename)
 
-                handleMultipart(client) { part ->
-                    part.provider().toInputStream().use { its ->
-                        Thumbnails
-                            .of(its)
-                            .size(128, 128)
-                            .imageType(BufferedImage.TYPE_INT_RGB)
-                            .outputFormat("JPEG")
-                            .outputQuality(0.8)
-                            .toFile(localFile)
+                avatarUploadSlots.withPermit {
+                    handleMultipart(client) { part ->
+                        part.provider().toInputStream().use { its ->
+                            Thumbnails
+                                .of(its)
+                                .size(128, 128)
+                                .imageType(BufferedImage.TYPE_INT_RGB)
+                                .outputFormat("JPEG")
+                                .outputQuality(0.8)
+                                .toFile(localFile)
 
-                        transaction {
-                            User.update({ User.id eq sess.userId }) {
-                                it[avatar] = "${Config.cdnBase("", true)}/avatar/$filename"
-                                it[updatedAt] = NowExpression(updatedAt)
+                            transaction {
+                                User.update({ User.id eq sess.userId }) {
+                                    it[avatar] = "${Config.cdnBase("", true)}/avatar/$filename"
+                                    it[updatedAt] = NowExpression(updatedAt)
+                                }
                             }
                         }
                     }
@@ -124,20 +132,22 @@ fun Route.uploadController(client: HttpClient) {
 
             val multipart = runCatching {
                 withContext(NonCancellable) {
-                    handleMultipart(client, totalLimit) { part ->
-                        uploadLogger.info("Upload of '${part.originalFileName}' started by '${session.uniqueName}' (${session.userId})")
+                    mapUploadSlots.withPermit {
+                        handleMultipart(client, totalLimit) { part ->
+                            uploadLogger.info("Upload of '${part.originalFileName}' started by '${session.uniqueName}' (${session.userId})")
 
-                        val its = part.provider()
+                            val its = part.provider()
 
-                        file.outputStream().buffered().use {
-                            its.copyToSuspend(it, sizeLimit = totalLimit)
-                        }.let { actualSize ->
-                            openZip(file) {
-                                validateFiles(
-                                    initValidation(vivifyLimit),
-                                    client
-                                )
-                            }.copy(compressedSize = actualSize)
+                            file.outputStream().buffered().use {
+                                its.copyToSuspend(it, sizeLimit = totalLimit)
+                            }.let { actualSize ->
+                                openZip(file) {
+                                    validateFiles(
+                                        initValidation(vivifyLimit),
+                                        client
+                                    )
+                                }.copy(compressedSize = actualSize)
+                            }
                         }
                     }
                 }

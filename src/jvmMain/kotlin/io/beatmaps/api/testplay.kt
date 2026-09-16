@@ -36,6 +36,7 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.controllers.userWipCount
 import io.beatmaps.util.GameTokenValidator
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.captchaIfPresent
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.optionalAuthorization
@@ -50,6 +51,8 @@ import io.ktor.server.resources.post
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.RoutingContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.toJavaInstant
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.Serializable
@@ -203,6 +206,9 @@ fun RoutingContext.getTestplayRecent(userId: Int, page: Long?) = transaction {
         }
 }
 
+private val tokenVerificationSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val testplayFeedbackSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun Route.testplayRoute(client: HttpClient) {
     post<TestplayApi.Queue> { req ->
         requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
@@ -308,21 +314,23 @@ fun Route.testplayRoute(client: HttpClient) {
 
     val validator = GameTokenValidator(client)
     post<MapsApi.Verify, AuthRequest>("Verify user tokens".responds(ok<ActionResponse>())) { _, auth ->
-        call.respond(
-            auth.steamId?.let { steamId ->
-                if (!validator.steam(steamId, auth.proof)) {
-                    ActionResponse.error("Could not validate steam token")
-                } else {
-                    ActionResponse.success()
-                }
-            } ?: auth.oculusId?.let { oculusId ->
-                if (!validator.oculus(oculusId, auth.proof)) {
-                    ActionResponse.error("Could not validate oculus token")
-                } else {
-                    ActionResponse.success()
-                }
-            } ?: ActionResponse.error("No user identifier provided")
-        )
+        tokenVerificationSlots.withPermit {
+            call.respond(
+                auth.steamId?.let { steamId ->
+                    if (!validator.steam(steamId, auth.proof)) {
+                        ActionResponse.error("Could not validate steam token")
+                    } else {
+                        ActionResponse.success()
+                    }
+                } ?: auth.oculusId?.let { oculusId ->
+                    if (!validator.oculus(oculusId, auth.proof)) {
+                        ActionResponse.error("Could not validate oculus token")
+                    } else {
+                        ActionResponse.success()
+                    }
+                } ?: ActionResponse.error("No user identifier provided")
+            )
+        }
     }
 
     post<TestplayApi.Mark> {
@@ -370,26 +378,28 @@ fun Route.testplayRoute(client: HttpClient) {
         requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
             val update = call.receive<FeedbackUpdate>()
 
-            captchaIfPresent(client, update.captcha) {
-                transaction {
-                    val subQuery = Versions.select(Versions.id).where { Versions.hash eq update.hash }
+            testplayFeedbackSlots.withPermit {
+                captchaIfPresent(client, update.captcha) {
+                    transaction {
+                        val subQuery = Versions.select(Versions.id).where { Versions.hash eq update.hash }
 
-                    if (update.captcha == null) {
-                        Testplay.update({ (Testplay.versionId eq wrapAsExpressionNotNull(subQuery)) and (Testplay.userId eq sess.userId) }) { t ->
-                            t[feedbackAt] = NowExpression(feedbackAt)
-                            t[feedback] = update.feedback
-                        }
-                    } else {
-                        Testplay.upsert(conflictIndex = Index(listOf(Testplay.versionId, Testplay.userId), true, "user_version_unique")) { t ->
-                            t[versionId] = wrapAsExpressionNotNull<Int>(subQuery)
-                            t[userId] = sess.userId
-                            t[feedbackAt] = NowExpression(feedbackAt)
-                            t[feedback] = update.feedback
+                        if (update.captcha == null) {
+                            Testplay.update({ (Testplay.versionId eq wrapAsExpressionNotNull(subQuery)) and (Testplay.userId eq sess.userId) }) { t ->
+                                t[feedbackAt] = NowExpression(feedbackAt)
+                                t[feedback] = update.feedback
+                            }
+                        } else {
+                            Testplay.upsert(conflictIndex = Index(listOf(Testplay.versionId, Testplay.userId), true, "user_version_unique")) { t ->
+                                t[versionId] = wrapAsExpressionNotNull<Int>(subQuery)
+                                t[userId] = sess.userId
+                                t[feedbackAt] = NowExpression(feedbackAt)
+                                t[feedback] = update.feedback
+                            }
                         }
                     }
-                }
 
-                call.respond(HttpStatusCode.OK)
+                    call.respond(HttpStatusCode.OK)
+                }
             }
         }
     }

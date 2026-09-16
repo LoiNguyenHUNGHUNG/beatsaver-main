@@ -4,18 +4,28 @@ import io.beatmaps.api.LeaderboardData
 import io.beatmaps.api.LeaderboardScore
 import io.beatmaps.common.api.EDifficulty
 import io.beatmaps.common.beatsaber.leaderboard.SSGameMode
+import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
+import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.request.get
 import kotlinx.serialization.Serializable
 
 class BeatLeaderScores(private val client: HttpClient) : RemoteScores {
-    override suspend fun getLeaderboard(hash: String, diff: EDifficulty, mode: SSGameMode, page: Int) =
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
+    private suspend fun fetchLeaderboard(hash: String, diff: EDifficulty, mode: SSGameMode, page: Int) =
         ssTry {
             client.get(
                 "https://api.beatleader.com/v5/scores/$hash/${diff.name}/${mode.characteristic.human()}?page=$page&count=12"
             ).body<BLPaged>()
-        }.let {
+        }
+
+    override suspend fun getLeaderboard(hash: String, diff: EDifficulty, mode: SSGameMode, page: Int) =
+        fetchLeaderboard(hash, diff, mode, page).let {
             LeaderboardData(
                 it?.container?.ranked == true,
                 it?.container?.leaderboardId,

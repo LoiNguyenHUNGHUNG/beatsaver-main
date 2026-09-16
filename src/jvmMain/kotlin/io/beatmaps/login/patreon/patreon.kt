@@ -6,8 +6,13 @@ import io.beatmaps.common.dbo.Patreon
 import io.beatmaps.common.dbo.PatreonLog
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.json
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
+import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
 import io.beatmaps.util.requireAuthorization
+import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsText
@@ -27,6 +32,8 @@ import io.ktor.server.response.respond
 import io.ktor.server.response.respondRedirect
 import io.ktor.server.routing.Route
 import io.ktor.util.hex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.toJavaInstant
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -114,48 +121,67 @@ abstract class PatreonFields {
         "fields%5B$fieldKey%5D=${fields.joinToString(",")}"
 }
 
+private val patreonLinkSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
+@NetworkDownload(
+    maxBytes = SMALL_RESPONSE_MAX_BYTES,
+    completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+)
+private suspend fun fetchPatreonIdentity(client: HttpClient, token: String, include: String, fields: String) =
+    client.get("https://patreon.com/api/oauth2/v2/identity?include=$include&$fields") {
+        timeout {
+            requestTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+        }
+        header("Authorization", "Bearer $token")
+    }.bodyAsText()
+
 fun Route.patreonLink(client: HttpClient) {
     authenticate("patreon") {
         get<PatreonLink> {
-            requireAuthorization { _, sess ->
-                val principal = call.authentication.principal<OAuthAccessTokenResponse.OAuth2>() ?: error("No principal")
+            patreonLinkSlots.withPermit {
+                requireAuthorization { _, sess ->
+                    val principal = call.authentication.principal<OAuthAccessTokenResponse.OAuth2>() ?: error("No principal")
 
-                val include = listOf("memberships", "memberships.currently_entitled_tiers")
-                val fields = listOf(PatreonTier, PatreonMembership).joinToString("&")
+                    val include = listOf("memberships", "memberships.currently_entitled_tiers")
+                    val fields = listOf(PatreonTier, PatreonMembership).joinToString("&")
 
-                val responseText = client.get("https://patreon.com/api/oauth2/v2/identity?include=${include.joinToString(",")}&$fields") {
-                    header("Authorization", "Bearer ${principal.accessToken}")
-                }.bodyAsText()
+                    val responseText = fetchPatreonIdentity(
+                        client,
+                        principal.accessToken,
+                        include.joinToString(","),
+                        fields
+                    )
 
-                transaction {
-                    PatreonLog.insert {
-                        it[type] = "login"
-                        it[text] = responseText
-                        it[time] = NowExpression(time)
+                    transaction {
+                        PatreonLog.insert {
+                            it[type] = "login"
+                            it[text] = responseText
+                            it[time] = NowExpression(time)
+                        }
                     }
+
+                    val response = json.decodeFromString<PatreonResponse>(responseText)
+                    val membership = response.getIncluded<PatreonMembership>(PatreonMembership).firstOrNull()
+                    val user = response.getIncluded<PatreonUser>(PatreonUser).first()
+                    val tierObj = response.getIncluded<PatreonTier>(PatreonTier).maxByOrNull { it.attributes.amountCents ?: Int.MIN_VALUE }
+
+                    transaction {
+                        Patreon.upsert(Patreon.id) {
+                            it[id] = user.id.toInt()
+                            it[pledge] = membership?.attributes?.currentlyEntitledAmountCents
+                            it[active] = membership?.attributes?.patronStatus == PatreonStatus.ACTIVE
+                            it[expireAt] = membership?.attributes?.nextChargeDate?.toJavaInstant()
+                            it[tier] = tierObj?.id?.toIntOrNull()
+                        }
+
+                        User.update({ User.id eq sess.userId }) {
+                            it[patreonId] = user.id.toInt()
+                            it[updatedAt] = NowExpression(updatedAt)
+                        }
+                    }
+
+                    call.respondRedirect("/profile#account")
                 }
-
-                val response = json.decodeFromString<PatreonResponse>(responseText)
-                val membership = response.getIncluded<PatreonMembership>(PatreonMembership).firstOrNull()
-                val user = response.getIncluded<PatreonUser>(PatreonUser).first()
-                val tierObj = response.getIncluded<PatreonTier>(PatreonTier).maxByOrNull { it.attributes.amountCents ?: Int.MIN_VALUE }
-
-                transaction {
-                    Patreon.upsert(Patreon.id) {
-                        it[id] = user.id.toInt()
-                        it[pledge] = membership?.attributes?.currentlyEntitledAmountCents
-                        it[active] = membership?.attributes?.patronStatus == PatreonStatus.ACTIVE
-                        it[expireAt] = membership?.attributes?.nextChargeDate?.toJavaInstant()
-                        it[tier] = tierObj?.id?.toIntOrNull()
-                    }
-
-                    User.update({ User.id eq sess.userId }) {
-                        it[patreonId] = user.id.toInt()
-                        it[updatedAt] = NowExpression(updatedAt)
-                    }
-                }
-
-                call.respondRedirect("/profile#account")
             }
         }
     }

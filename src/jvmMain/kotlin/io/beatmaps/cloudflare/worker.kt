@@ -1,5 +1,8 @@
 package io.beatmaps.cloudflare
 
+import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
+import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.plugins.HttpRequestTimeoutException
@@ -14,8 +17,22 @@ import io.ktor.http.contentType
 import kotlinx.serialization.Serializable
 
 interface IKVStore {
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun getKeys(): List<String>
+
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun setValue(key: String, value: String)
+
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun setValues(kvs: List<KeyValue>)
 }
 
@@ -32,7 +49,7 @@ private fun requestCommon(builder: HttpRequestBuilder, authToken: String) {
     builder.header("Authorization", "Bearer $authToken")
     builder.timeout {
         socketTimeoutMillis = 5000
-        requestTimeoutMillis = 20000
+        requestTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
     }
 }
 

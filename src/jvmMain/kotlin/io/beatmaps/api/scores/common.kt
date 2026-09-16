@@ -4,6 +4,8 @@ import io.beatmaps.api.LeaderboardData
 import io.beatmaps.common.api.EDifficulty
 import io.beatmaps.common.beatsaber.leaderboard.SSGameMode
 import io.beatmaps.common.jsonIgnoreUnknown
+import io.beatmaps.util.SMALL_RESPONSE_RATE_BYTES_PER_SECOND
+import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.apache.Apache
 import io.ktor.client.plugins.ClientRequestException
@@ -51,5 +53,6 @@ suspend fun <T> ssTry(block: suspend () -> T) =
     }
 
 interface RemoteScores {
+    @BandwidthEffect(rMaxBytesPerSecond = SMALL_RESPONSE_RATE_BYTES_PER_SECOND, nMax = 2)
     suspend fun getLeaderboard(hash: String, diff: EDifficulty = EDifficulty.ExpertPlus, mode: SSGameMode = SSGameMode.SoloStandard, page: Int = 1): LeaderboardData
 }

@@ -6,11 +6,16 @@ import org.jetbrains.kotlin.gradle.targets.js.webpack.KotlinWebpack
 import org.jlleitschuh.gradle.ktlint.reporter.ReporterType
 
 plugins {
-    kotlin("multiplatform") version "2.2.0"
-    kotlin("plugin.serialization") version "2.2.0"
+    kotlin("multiplatform") version "2.4.10"
+    kotlin("plugin.serialization") version "2.4.10"
+    id("io.github.loinguyen.bandwidth")
     id("io.miret.etienne.sass") version "1.1.2"
     id("org.flywaydb.flyway") version "9.2.2"
     id("org.jlleitschuh.gradle.ktlint") version "11.5.1"
+}
+
+bandwidthChecker {
+    reportEffects.set(true)
 }
 
 val exposedVersion: String by project
@@ -205,7 +210,8 @@ kotlin {
                 implementation("nl.myndocs:oauth2-server-device-code-store-inmemory:$myndocsOauthVersion")
 
                 // Asset bundles - os specific
-                val os = DefaultNativePlatform.getCurrentOperatingSystem().toFamilyName()
+                val os = providers.gradleProperty("kabtOs")
+                    .getOrElse(DefaultNativePlatform.getCurrentOperatingSystem().toFamilyName())
                 implementation("io.beatmaps:kabt-jni:1.0.8:uber-$os")
                 implementation("io.beatmaps:kabt-base:1.0.8")
                 implementation("io.beatmaps:kabt:1.0.8")
