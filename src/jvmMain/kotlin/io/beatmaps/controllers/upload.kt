@@ -53,6 +53,8 @@ import java.io.IOException
 import java.lang.Integer.toHexString
 import java.util.logging.Logger
 
+private val uploadMapPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 @Resource("/upload")
 class UploadMap
 
@@ -121,74 +123,76 @@ fun Route.uploadController(client: HttpClient) {
     }
 
     post<UploadMap> {
-        requireAuthorization { authType, session ->
-            val (user, wipSlotsFree) = Upload.checkUserCanUpload(session)
+        uploadMapPostSlots.withPermit {
+            requireAuthorization { authType, session ->
+                val (user, wipSlotsFree) = Upload.checkUserCanUpload(session)
 
-            val file = File(
-                Folders.uploadTempFolder(),
-                "upload-${System.currentTimeMillis()}-${session.userId.hashCode()}.zip"
-            )
+                val file = File(
+                    Folders.uploadTempFolder(),
+                    "upload-${System.currentTimeMillis()}-${session.userId.hashCode()}.zip"
+                )
 
-            val basicLimit = user.uploadLimit * 1024 * 1024L
-            val vivifyLimit = user.vivifyLimit * 1024 * 1024L
-            val totalLimit = basicLimit + (vivifyLimit * Vivify.allowedBundles.size)
+                val basicLimit = user.uploadLimit * 1024 * 1024L
+                val vivifyLimit = user.vivifyLimit * 1024 * 1024L
+                val totalLimit = basicLimit + (vivifyLimit * Vivify.allowedBundles.size)
 
-            val multipart = runCatching {
-                withContext(NonCancellable) {
-                    mapUploadSlots.withPermit {
-                        handleMultipart(client, totalLimit) { part ->
-                            uploadLogger.info("Upload of '${part.originalFileName}' started by '${session.uniqueName}' (${session.userId})")
+                val multipart = runCatching {
+                    withContext(NonCancellable) {
+                        mapUploadSlots.withPermit {
+                            handleMultipart(client, totalLimit) { part ->
+                                uploadLogger.info("Upload of '${part.originalFileName}' started by '${session.uniqueName}' (${session.userId})")
 
-                            val its = part.provider()
+                                val its = part.provider()
 
-                            file.outputStream().buffered().use {
-                                its.copyToSuspend(it, sizeLimit = totalLimit)
-                            }.let { actualSize ->
-                                openZip(file) {
-                                    validateFiles(
-                                        initValidation(vivifyLimit),
-                                        client
-                                    )
-                                }.copy(compressedSize = actualSize)
+                                file.outputStream().buffered().use {
+                                    its.copyToSuspend(it, sizeLimit = totalLimit)
+                                }.let { actualSize ->
+                                    openZip(file) {
+                                        validateFiles(
+                                            initValidation(vivifyLimit),
+                                            client
+                                        )
+                                    }.copy(compressedSize = actualSize)
+                                }
                             }
                         }
                     }
-                }
-            }.getOrElse { e ->
-                file.delete()
+                }.getOrElse { e ->
+                    file.delete()
 
-                when (e) {
-                    is RarException -> throw UploadException("Don't upload rar files. Use the package button in your map editor.")
-                    is SerializationException -> {
-                        e.printStackTrace()
-                        throw UploadException("Could not parse json")
+                    when (e) {
+                        is RarException -> throw UploadException("Don't upload rar files. Use the package button in your map editor.")
+                        is SerializationException -> {
+                            e.printStackTrace()
+                            throw UploadException("Could not parse json")
+                        }
+                        is ZipHelperException -> throw UploadException(e.msg)
+                        is IOException -> throw UploadException("Zip file too big")
+                        is CopyException -> throw UploadException("Zip file too big")
+                        else -> throw e
                     }
-                    is ZipHelperException -> throw UploadException(e.msg)
-                    is IOException -> throw UploadException("Zip file too big")
-                    is CopyException -> throw UploadException("Zip file too big")
-                    else -> throw e
                 }
+
+                multipart.validRecaptcha(authType) || throw UploadException("Missing recaptcha?")
+                val data = multipart.get<MapUploadMultipart>()
+
+                wipSlotsFree || data.mapId != null || throw UploadException(PatreonTier.maxWipsMessage)
+
+                val extractedInfo = multipart.fileOutput ?: throw UploadException("Internal error 1")
+
+                // Zip could have been too big but within vivify allowance
+                val sizeWithoutVivify = extractedInfo.compressedSize - extractedInfo.vivifySize
+                if (sizeWithoutVivify > basicLimit) {
+                    throw UploadException("Zip file too big (${FileLimits.printLimit(sizeWithoutVivify, basicLimit)})")
+                }
+
+                val newMapId = Upload.insertNewMap(extractedInfo, data, session, file)
+
+                modelRabbitMqOperation()
+
+                call.pub("beatmaps", "maps.$newMapId.updated.upload", null, newMapId)
+                call.respond(UploadResponse(toHexString(newMapId)))
             }
-
-            multipart.validRecaptcha(authType) || throw UploadException("Missing recaptcha?")
-            val data = multipart.get<MapUploadMultipart>()
-
-            wipSlotsFree || data.mapId != null || throw UploadException(PatreonTier.maxWipsMessage)
-
-            val extractedInfo = multipart.fileOutput ?: throw UploadException("Internal error 1")
-
-            // Zip could have been too big but within vivify allowance
-            val sizeWithoutVivify = extractedInfo.compressedSize - extractedInfo.vivifySize
-            if (sizeWithoutVivify > basicLimit) {
-                throw UploadException("Zip file too big (${FileLimits.printLimit(sizeWithoutVivify, basicLimit)})")
-            }
-
-            val newMapId = Upload.insertNewMap(extractedInfo, data, session, file)
-
-            modelRabbitMqOperation()
-
-            call.pub("beatmaps", "maps.$newMapId.updated.upload", null, newMapId)
-            call.respond(UploadResponse(toHexString(newMapId)))
         }
     }
 }

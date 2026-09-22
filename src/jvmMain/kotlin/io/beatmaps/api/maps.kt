@@ -51,6 +51,7 @@ import io.beatmaps.common.util.LenientInstantSerializer
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.login.Session
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelRabbitMqOperation
@@ -67,6 +68,8 @@ import io.ktor.server.response.respondRedirect
 import io.ktor.server.routing.Route
 import io.ktor.server.sessions.get
 import io.ktor.server.sessions.sessions
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Instant
 import kotlinx.datetime.toJavaInstant
 import kotlinx.datetime.toKotlinInstant
@@ -80,6 +83,24 @@ import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransacti
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import java.lang.Integer.toHexString
+
+private val mapsApiCuratePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiDeclareAiPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiMarkNsfwPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiUpdatePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiTagUpdatePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiDetailGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiInPlaylistsGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiBeatsaverGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiBeatsaverDownloadGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiByIdsGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiByHashGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiWIPGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiByUploaderGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiCollaborationsGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiByUploadDateGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiDeletedGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiByPlayCountGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 @Resource("/api")
 class MapsApi {
@@ -312,162 +333,127 @@ enum class LatestSort {
 
 fun Route.mapDetailRoute() {
     post<MapsApi.Curate> {
-        requireAuthorization { _, user ->
-            if (!user.isCurator()) {
-                call.respond(HttpStatusCode.BadRequest)
-            } else {
-                val mapUpdate = call.receive<CurateMap>()
+        mapsApiCuratePostSlots.withPermit {
+            requireAuthorization { _, user ->
+                if (!user.isCurator()) {
+                    call.respond(HttpStatusCode.BadRequest)
+                } else {
+                    val mapUpdate = call.receive<CurateMap>()
 
-                val result = transaction {
-                    modelPostgresOperation()
-                    fun curateMap() =
-                        Beatmap.update({
-                            (Beatmap.id eq mapUpdate.id) and (Beatmap.uploader neq user.userId) and (if (mapUpdate.curated) Beatmap.curatedAt.isNull() else Beatmap.curatedAt.isNotNull())
-                        }) {
-                            if (mapUpdate.curated) {
-                                it[curatedAt] = NowExpression(curatedAt)
-                                it[curator] = user.userId
-                            } else {
-                                it[curatedAt] = null
-                                it[curator] = null
-                            }
-                            it[updatedAt] = NowExpression(updatedAt)
-                        }
-
-                    (curateMap() > 0).also { success ->
-                        if (success) {
-                            Beatmap.joinUploader().selectAll().where {
-                                Beatmap.id eq mapUpdate.id
-                            }.complexToBeatmap().single().let {
-                                // Handle alerts for curation
-                                // When curating we send alerts to the uploader and their followers
-                                // When uncurating we just send alerts to the uploader
+                    val result = transaction {
+                        modelPostgresOperation()
+                        fun curateMap() =
+                            Beatmap.update({
+                                (Beatmap.id eq mapUpdate.id) and (Beatmap.uploader neq user.userId) and (if (mapUpdate.curated) Beatmap.curatedAt.isNull() else Beatmap.curatedAt.isNotNull())
+                            }) {
                                 if (mapUpdate.curated) {
-                                    if (it.uploader.curationAlerts) {
+                                    it[curatedAt] = NowExpression(curatedAt)
+                                    it[curator] = user.userId
+                                } else {
+                                    it[curatedAt] = null
+                                    it[curator] = null
+                                }
+                                it[updatedAt] = NowExpression(updatedAt)
+                            }
+
+                        (curateMap() > 0).also { success ->
+                            if (success) {
+                                Beatmap.joinUploader().selectAll().where {
+                                    Beatmap.id eq mapUpdate.id
+                                }.complexToBeatmap().single().let {
+                                    // Handle alerts for curation
+                                    // When curating we send alerts to the uploader and their followers
+                                    // When uncurating we just send alerts to the uploader
+                                    if (mapUpdate.curated) {
+                                        if (it.uploader.curationAlerts) {
+                                            Alert.insert(
+                                                "Your map has been curated",
+                                                "@${user.uniqueName} just curated your map #${toHexString(mapUpdate.id)}: **${it.name}**.\n" +
+                                                    "Congratulations!",
+                                                EAlertType.Curation,
+                                                it.uploader.id.value
+                                            )
+                                        }
+
+                                        val recipients = Follows.selectAll().where {
+                                            Follows.userId eq user.userId and Follows.curation and Follows.following
+                                        }.map { row ->
+                                            row[Follows.followerId].value
+                                        }
+
                                         Alert.insert(
-                                            "Your map has been curated",
-                                            "@${user.uniqueName} just curated your map #${toHexString(mapUpdate.id)}: **${it.name}**.\n" +
-                                                "Congratulations!",
-                                            EAlertType.Curation,
+                                            "Followed Curation",
+                                            "@${user.uniqueName} just curated #${toHexString(mapUpdate.id)}: **${it.name}**.\n" +
+                                                "*\"${Alert.forDescription(it.description)}\"*",
+                                            EAlertType.MapCurated,
+                                            recipients
+                                        )
+                                        updateAlertCount(recipients.plus(it.uploader.id.value))
+                                    } else {
+                                        Alert.insert(
+                                            "Your map has been uncurated",
+                                            "@${user.uniqueName} just uncurated your map #${toHexString(mapUpdate.id)}: **${it.name}**.\n" +
+                                                "Reason: *\"${mapUpdate.reason ?: ""}\"*",
+                                            EAlertType.Uncuration,
                                             it.uploader.id.value
                                         )
+                                        updateAlertCount(it.uploader.id.value)
+
+                                        ModLog.insert(user.userId, mapUpdate.id, UnCurateMapData(mapUpdate.reason), it.uploader.id.value)
                                     }
-
-                                    val recipients = Follows.selectAll().where {
-                                        Follows.userId eq user.userId and Follows.curation and Follows.following
-                                    }.map { row ->
-                                        row[Follows.followerId].value
-                                    }
-
-                                    Alert.insert(
-                                        "Followed Curation",
-                                        "@${user.uniqueName} just curated #${toHexString(mapUpdate.id)}: **${it.name}**.\n" +
-                                            "*\"${Alert.forDescription(it.description)}\"*",
-                                        EAlertType.MapCurated,
-                                        recipients
-                                    )
-                                    updateAlertCount(recipients.plus(it.uploader.id.value))
-                                } else {
-                                    Alert.insert(
-                                        "Your map has been uncurated",
-                                        "@${user.uniqueName} just uncurated your map #${toHexString(mapUpdate.id)}: **${it.name}**.\n" +
-                                            "Reason: *\"${mapUpdate.reason ?: ""}\"*",
-                                        EAlertType.Uncuration,
-                                        it.uploader.id.value
-                                    )
-                                    updateAlertCount(it.uploader.id.value)
-
-                                    ModLog.insert(user.userId, mapUpdate.id, UnCurateMapData(mapUpdate.reason), it.uploader.id.value)
                                 }
                             }
                         }
                     }
-                }
 
-                if (result) {
-                    modelRabbitMqOperation()
-                    call.pub("beatmaps", "maps.${mapUpdate.id}.updated.curation", null, mapUpdate.id)
+                    if (result) {
+                        modelRabbitMqOperation()
+                        call.pub("beatmaps", "maps.${mapUpdate.id}.updated.curation", null, mapUpdate.id)
+                    }
+                    call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
                 }
-                call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
             }
         }
     }
 
     post<MapsApi.DeclareAi> {
-        requireAuthorization { _, user ->
-            val mapUpdate = call.receive<AiDeclaration>()
-            val result = transaction {
-                modelPostgresOperation()
-                val admin = user.isAdmin()
-
-                transaction {
-                    modelPostgresOperation()
-                    Beatmap.updateReturning(
-                        {
-                            (Beatmap.id eq mapUpdate.id).let { q ->
-                                if (admin) {
-                                    q // If current user is admin don't check the user
-                                } else {
-                                    q and (Beatmap.uploader eq user.userId)
-                                }
-                            }
-                        }, {
-                            it[declaredAi] = when {
-                                !mapUpdate.automapper && admin -> AiDeclarationType.None
-                                mapUpdate.automapper && admin -> AiDeclarationType.Admin
-                                else -> AiDeclarationType.Uploader
-                            }
-                            it[updatedAt] = NowExpression(updatedAt)
-                        },
-                        Beatmap.uploader
-                    ).let { rows ->
-                        (!rows.isNullOrEmpty()).also { success ->
-                            if (success && admin && rows != null) {
-                                ModLog.insert(
-                                    user.userId,
-                                    mapUpdate.id,
-                                    FlagsEditData(ai = mapUpdate.automapper),
-                                    rows.first()[Beatmap.uploader].value
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (result) {
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "maps.${mapUpdate.id}.updated.ai", null, mapUpdate.id)
-            }
-            call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
-        }
-    }
-
-    post<MapsApi.MarkNsfw> {
-        requireAuthorization { _, user ->
-            if (!user.isAdmin()) {
-                call.respond(HttpStatusCode.BadRequest)
-            } else {
-                val mapUpdate = call.receive<MarkNsfw>()
+        mapsApiDeclareAiPostSlots.withPermit {
+            requireAuthorization { _, user ->
+                val mapUpdate = call.receive<AiDeclaration>()
                 val result = transaction {
                     modelPostgresOperation()
-                    Beatmap.updateReturning(
-                        {
-                            (Beatmap.id eq mapUpdate.id)
-                        }, {
-                            it[nsfw] = mapUpdate.nsfw
-                            it[updatedAt] = NowExpression(updatedAt)
-                        },
-                        Beatmap.uploader
-                    ).let { rows ->
-                        (!rows.isNullOrEmpty()).also { success ->
-                            if (success && rows != null) {
-                                ModLog.insert(
-                                    user.userId,
-                                    mapUpdate.id,
-                                    FlagsEditData(nsfw = mapUpdate.nsfw),
-                                    rows.first()[Beatmap.uploader].value
-                                )
+                    val admin = user.isAdmin()
+
+                    transaction {
+                        modelPostgresOperation()
+                        Beatmap.updateReturning(
+                            {
+                                (Beatmap.id eq mapUpdate.id).let { q ->
+                                    if (admin) {
+                                        q // If current user is admin don't check the user
+                                    } else {
+                                        q and (Beatmap.uploader eq user.userId)
+                                    }
+                                }
+                            }, {
+                                it[declaredAi] = when {
+                                    !mapUpdate.automapper && admin -> AiDeclarationType.None
+                                    mapUpdate.automapper && admin -> AiDeclarationType.Admin
+                                    else -> AiDeclarationType.Uploader
+                                }
+                                it[updatedAt] = NowExpression(updatedAt)
+                            },
+                            Beatmap.uploader
+                        ).let { rows ->
+                            (!rows.isNullOrEmpty()).also { success ->
+                                if (success && admin && rows != null) {
+                                    ModLog.insert(
+                                        user.userId,
+                                        mapUpdate.id,
+                                        FlagsEditData(ai = mapUpdate.automapper),
+                                        rows.first()[Beatmap.uploader].value
+                                    )
+                                }
                             }
                         }
                     }
@@ -475,380 +461,473 @@ fun Route.mapDetailRoute() {
 
                 if (result) {
                     modelRabbitMqOperation()
-                    call.pub("beatmaps", "maps.${mapUpdate.id}.updated.nsfw", null, mapUpdate.id)
+                    call.pub("beatmaps", "maps.${mapUpdate.id}.updated.ai", null, mapUpdate.id)
                 }
                 call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
             }
         }
     }
 
-    post<MapsApi.Update> {
-        requireAuthorization { _, user ->
-            val mapUpdate = call.receive<MapInfoUpdate>()
-
-            val tooMany = mapUpdate.tags?.groupBy { it.type }?.mapValues { it.value.size }?.withDefault { 0 }?.let { byType ->
-                MapTag.maxPerType.any { byType.getValue(it.key) > it.value }
-            }
-
-            val result = transaction {
-                modelPostgresOperation()
-                val oldData = if (user.isAdmin()) {
-                    BeatmapDao.wrapRow(Beatmap.selectAll().where { Beatmap.id eq mapUpdate.id }.single())
+    post<MapsApi.MarkNsfw> {
+        mapsApiMarkNsfwPostSlots.withPermit {
+            requireAuthorization { _, user ->
+                if (!user.isAdmin()) {
+                    call.respond(HttpStatusCode.BadRequest)
                 } else {
-                    null
-                }
-
-                fun updateMap() =
-                    Beatmap.update({
-                        (Beatmap.id eq mapUpdate.id and Beatmap.deletedAt.isNull()).let { q ->
-                            if (user.isAdmin()) {
-                                q // If current user is admin don't check the user
-                            } else {
-                                q and (Beatmap.uploader eq user.userId)
+                    val mapUpdate = call.receive<MarkNsfw>()
+                    val result = transaction {
+                        modelPostgresOperation()
+                        Beatmap.updateReturning(
+                            {
+                                (Beatmap.id eq mapUpdate.id)
+                            }, {
+                                it[nsfw] = mapUpdate.nsfw
+                                it[updatedAt] = NowExpression(updatedAt)
+                            },
+                            Beatmap.uploader
+                        ).let { rows ->
+                            (!rows.isNullOrEmpty()).also { success ->
+                                if (success && rows != null) {
+                                    ModLog.insert(
+                                        user.userId,
+                                        mapUpdate.id,
+                                        FlagsEditData(nsfw = mapUpdate.nsfw),
+                                        rows.first()[Beatmap.uploader].value
+                                    )
+                                }
                             }
-                        }
-                    }) {
-                        if (mapUpdate.deleted) {
-                            it[deletedAt] = NowExpression(deletedAt)
-                        } else {
-                            mapUpdate.name?.let { n -> it[name] = n.take(MapConstants.MAX_NAME_LENGTH) }
-                            mapUpdate.description?.let { d -> it[description] = d.take(MapConstants.MAX_DESCRIPTION_LENGTH) }
-                            if (tooMany != true) { // Don't update tags if request is trying to add too many tags
-                                mapUpdate.tags?.filter { t -> t != MapTag.None }?.map { t -> t.slug }?.let { t -> it[tags] = t }
-                            }
-                            it[updatedAt] = NowExpression(updatedAt)
                         }
                     }
 
-                (updateMap() > 0).also { rTemp ->
-                    if (rTemp && oldData != null && oldData.uploaderId.value != user.userId) {
-                        ModLog.insert(
-                            user.userId,
-                            mapUpdate.id,
+                    if (result) {
+                        modelRabbitMqOperation()
+                        call.pub("beatmaps", "maps.${mapUpdate.id}.updated.nsfw", null, mapUpdate.id)
+                    }
+                    call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
+                }
+            }
+        }
+    }
+
+    post<MapsApi.Update> {
+        mapsApiUpdatePostSlots.withPermit {
+            requireAuthorization { _, user ->
+                val mapUpdate = call.receive<MapInfoUpdate>()
+
+                val tooMany = mapUpdate.tags?.groupBy { it.type }?.mapValues { it.value.size }?.withDefault { 0 }?.let { byType ->
+                    MapTag.maxPerType.any { byType.getValue(it.key) > it.value }
+                }
+
+                val result = transaction {
+                    modelPostgresOperation()
+                    val oldData = if (user.isAdmin()) {
+                        BeatmapDao.wrapRow(Beatmap.selectAll().where { Beatmap.id eq mapUpdate.id }.single())
+                    } else {
+                        null
+                    }
+
+                    fun updateMap() =
+                        Beatmap.update({
+                            (Beatmap.id eq mapUpdate.id and Beatmap.deletedAt.isNull()).let { q ->
+                                if (user.isAdmin()) {
+                                    q // If current user is admin don't check the user
+                                } else {
+                                    q and (Beatmap.uploader eq user.userId)
+                                }
+                            }
+                        }) {
                             if (mapUpdate.deleted) {
-                                DeletedData(mapUpdate.reason ?: "")
+                                it[deletedAt] = NowExpression(deletedAt)
                             } else {
-                                InfoEditData(
-                                    oldData.name,
-                                    oldData.description,
-                                    mapUpdate.name ?: "",
-                                    mapUpdate.description ?: "",
-                                    oldData.tags?.mapNotNull { MapTag.fromSlug(it) },
-                                    mapUpdate.tags
-                                )
-                            },
-                            oldData.uploaderId.value
-                        )
-                        if (mapUpdate.deleted) {
-                            Alert.insert(
-                                "Removal Notice",
-                                "Your map #${toHexString(mapUpdate.id)}: **${oldData.name}** has been removed by a moderator.\n" +
-                                    "Reason: *\"${mapUpdate.reason}\"*",
-                                EAlertType.Deletion,
+                                mapUpdate.name?.let { n -> it[name] = n.take(MapConstants.MAX_NAME_LENGTH) }
+                                mapUpdate.description?.let { d -> it[description] = d.take(MapConstants.MAX_DESCRIPTION_LENGTH) }
+                                if (tooMany != true) { // Don't update tags if request is trying to add too many tags
+                                    mapUpdate.tags?.filter { t -> t != MapTag.None }?.map { t -> t.slug }?.let { t -> it[tags] = t }
+                                }
+                                it[updatedAt] = NowExpression(updatedAt)
+                            }
+                        }
+
+                    (updateMap() > 0).also { rTemp ->
+                        if (rTemp && oldData != null && oldData.uploaderId.value != user.userId) {
+                            ModLog.insert(
+                                user.userId,
+                                mapUpdate.id,
+                                if (mapUpdate.deleted) {
+                                    DeletedData(mapUpdate.reason ?: "")
+                                } else {
+                                    InfoEditData(
+                                        oldData.name,
+                                        oldData.description,
+                                        mapUpdate.name ?: "",
+                                        mapUpdate.description ?: "",
+                                        oldData.tags?.mapNotNull { MapTag.fromSlug(it) },
+                                        mapUpdate.tags
+                                    )
+                                },
                                 oldData.uploaderId.value
                             )
+                            if (mapUpdate.deleted) {
+                                Alert.insert(
+                                    "Removal Notice",
+                                    "Your map #${toHexString(mapUpdate.id)}: **${oldData.name}** has been removed by a moderator.\n" +
+                                        "Reason: *\"${mapUpdate.reason}\"*",
+                                    EAlertType.Deletion,
+                                    oldData.uploaderId.value
+                                )
 
-                            updateAlertCount(oldData.uploaderId.value)
+                                updateAlertCount(oldData.uploaderId.value)
+                            }
+                        }
+
+                        if (mapUpdate.deleted) {
+                            val alertIds = Collaboration.deleteForMap(mapUpdate.id)
+                            updateAlertCount(alertIds)
                         }
                     }
-
-                    if (mapUpdate.deleted) {
-                        val alertIds = Collaboration.deleteForMap(mapUpdate.id)
-                        updateAlertCount(alertIds)
-                    }
                 }
-            }
 
-            val updateType = if (mapUpdate.deleted) "delete" else "info"
-            if (result) {
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "maps.${mapUpdate.id}.updated.$updateType", null, mapUpdate.id)
+                val updateType = if (mapUpdate.deleted) "delete" else "info"
+                if (result) {
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "maps.${mapUpdate.id}.updated.$updateType", null, mapUpdate.id)
+                }
+                call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
             }
-            call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
         }
     }
 
     post<MapsApi.TagUpdate> {
-        requireAuthorization { _, user ->
-            val mapUpdate = call.receive<SimpleMapInfoUpdate>()
+        mapsApiTagUpdatePostSlots.withPermit {
+            requireAuthorization { _, user ->
+                val mapUpdate = call.receive<SimpleMapInfoUpdate>()
 
-            val tooMany = mapUpdate.tags?.groupBy { it.type }?.mapValues { it.value.size }?.withDefault { 0 }?.let { byType ->
-                MapTag.maxPerType.any { byType.getValue(it.key) > it.value }
-            }
+                val tooMany = mapUpdate.tags?.groupBy { it.type }?.mapValues { it.value.size }?.withDefault { 0 }?.let { byType ->
+                    MapTag.maxPerType.any { byType.getValue(it.key) > it.value }
+                }
 
-            val result = if (tooMany != true && user.isCurator()) {
-                transaction {
-                    modelPostgresOperation()
-                    val oldData = BeatmapDao.wrapRow(Beatmap.selectAll().where { Beatmap.id eq mapUpdate.id }.single())
+                val result = if (tooMany != true && user.isCurator()) {
+                    transaction {
+                        modelPostgresOperation()
+                        val oldData = BeatmapDao.wrapRow(Beatmap.selectAll().where { Beatmap.id eq mapUpdate.id }.single())
 
-                    fun updateMap() =
-                        Beatmap.update({
-                            Beatmap.id eq mapUpdate.id and Beatmap.deletedAt.isNull()
-                        }) {
-                            mapUpdate.tags?.filter { t -> t != MapTag.None }?.map { t -> t.slug }?.let { t -> it[tags] = t }
-                            it[updatedAt] = NowExpression(updatedAt)
-                        }
+                        fun updateMap() =
+                            Beatmap.update({
+                                Beatmap.id eq mapUpdate.id and Beatmap.deletedAt.isNull()
+                            }) {
+                                mapUpdate.tags?.filter { t -> t != MapTag.None }?.map { t -> t.slug }?.let { t -> it[tags] = t }
+                                it[updatedAt] = NowExpression(updatedAt)
+                            }
 
-                    (updateMap() > 0).also { rTemp ->
-                        if (rTemp && oldData.uploaderId.value != user.userId) {
-                            ModLog.insert(
-                                user.userId,
-                                mapUpdate.id,
-                                InfoEditData(oldData.name, oldData.description, "", "", oldData.tags?.mapNotNull { MapTag.fromSlug(it) }, mapUpdate.tags),
-                                oldData.uploader.id.value
-                            )
+                        (updateMap() > 0).also { rTemp ->
+                            if (rTemp && oldData.uploaderId.value != user.userId) {
+                                ModLog.insert(
+                                    user.userId,
+                                    mapUpdate.id,
+                                    InfoEditData(oldData.name, oldData.description, "", "", oldData.tags?.mapNotNull { MapTag.fromSlug(it) }, mapUpdate.tags),
+                                    oldData.uploader.id.value
+                                )
+                            }
                         }
                     }
+                } else {
+                    false
                 }
-            } else {
-                false
-            }
 
-            if (result) {
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "maps.${mapUpdate.id}.updated.info", null, mapUpdate.id)
+                if (result) {
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "maps.${mapUpdate.id}.updated.info", null, mapUpdate.id)
+                }
+                call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
             }
-            call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
         }
     }
 
     getWithOptions<MapsApi.Detail>("Get map information".responds(ok<MapDetail>(), notFound())) {
-        val sess = call.sessions.get<Session>()
-        val isAdmin = sess?.isAdmin() == true
-        val r = try {
-            transaction {
-                modelPostgresOperation()
-                Beatmap
-                    .joinVersions(true, state = null) // Allow returning non-published versions
-                    .joinUploader()
-                    .joinCurator()
-                    .joinBookmarked(sess?.userId)
-                    .joinCollaborators()
-                    .selectAll()
-                    .where {
-                        (Beatmap.id eq it.id.toInt(16)).let {
-                            if (isAdmin) {
-                                it
-                            } else {
-                                it and Beatmap.deletedAt.isNull()
+        mapsApiDetailGetSlots.withPermit {
+            val sess = call.sessions.get<Session>()
+            val isAdmin = sess?.isAdmin() == true
+            val r = try {
+                transaction {
+                    modelPostgresOperation()
+                    Beatmap
+                        .joinVersions(true, state = null) // Allow returning non-published versions
+                        .joinUploader()
+                        .joinCurator()
+                        .joinBookmarked(sess?.userId)
+                        .joinCollaborators()
+                        .selectAll()
+                        .where {
+                            (Beatmap.id eq it.id.toInt(16)).let {
+                                if (isAdmin) {
+                                    it
+                                } else {
+                                    it and Beatmap.deletedAt.isNull()
+                                }
                             }
                         }
-                    }
-                    .complexToBeatmap()
-                    .firstOrNull()
-                    ?.enrichTestplays()
-                    ?.run {
-                        MapDetail.from(this, cdnPrefix())
-                    }
+                        .complexToBeatmap()
+                        .firstOrNull()
+                        ?.enrichTestplays()
+                        ?.run {
+                            MapDetail.from(this, cdnPrefix())
+                        }
+                }
+            } catch (_: NumberFormatException) {
+                null
             }
-        } catch (_: NumberFormatException) {
-            null
-        }
 
-        if (r != null && (r.publishedVersion() != null || r.uploader.id == sess?.userId || sess?.testplay == true || isAdmin)) {
-            call.respond(r)
-        } else {
-            call.respond(HttpStatusCode.NotFound)
+            if (r != null && (r.publishedVersion() != null || r.uploader.id == sess?.userId || sess?.testplay == true || isAdmin)) {
+                call.respond(r)
+            } else {
+                call.respond(HttpStatusCode.NotFound)
+            }
         }
     }
 
     get<MapsApi.InPlaylists> {
-        val mapId = it.id
+        mapsApiInPlaylistsGetSlots.withPermit {
+            val mapId = it.id
 
-        requireAuthorization { _, sess ->
-            try {
-                transaction {
-                    modelPostgresOperation()
-                    Playlist.joinMaps {
-                        PlaylistMap.mapId eq mapId.toInt(16)
-                    }.selectAll().where {
-                        Playlist.owner eq sess.userId and Playlist.deletedAt.isNull() and (Playlist.type neq EPlaylistType.Search)
-                    }.orderBy(Playlist.createdAt, SortOrder.DESC).map { row ->
-                        PlaylistDao.wrapRow(row) to (row.getOrNull(PlaylistMap.id) != null)
+            requireAuthorization { _, sess ->
+                try {
+                    transaction {
+                        modelPostgresOperation()
+                        Playlist.joinMaps {
+                            PlaylistMap.mapId eq mapId.toInt(16)
+                        }.selectAll().where {
+                            Playlist.owner eq sess.userId and Playlist.deletedAt.isNull() and (Playlist.type neq EPlaylistType.Search)
+                        }.orderBy(Playlist.createdAt, SortOrder.DESC).map { row ->
+                            PlaylistDao.wrapRow(row) to (row.getOrNull(PlaylistMap.id) != null)
+                        }
+                    }.map { pmd -> InPlaylist(PlaylistBasic.from(pmd.first, cdnPrefix()), pmd.second) }
+                } catch (_: NumberFormatException) {
+                    null
+                }.let { inPlaylists ->
+                    when (inPlaylists) {
+                        null -> call.respond(HttpStatusCode.NotFound)
+                        else -> call.respond(inPlaylists)
                     }
-                }.map { pmd -> InPlaylist(PlaylistBasic.from(pmd.first, cdnPrefix()), pmd.second) }
-            } catch (_: NumberFormatException) {
-                null
-            }.let { inPlaylists ->
-                when (inPlaylists) {
-                    null -> call.respond(HttpStatusCode.NotFound)
-                    else -> call.respond(inPlaylists)
                 }
             }
         }
     }
 
     getWithOptions<MapsApi.Beatsaver> {
-        val r = transaction {
-            modelPostgresOperation()
-            Beatmap
-                .joinVersions(true)
-                .joinUploader()
-                .joinCurator()
-                .selectAll()
-                .where {
-                    Beatmap.id.inSubQuery(
-                        Versions
-                            .select(Versions.mapId)
-                            .where {
-                                Versions.key64 eq it.key
-                            }
-                            .limit(1)
-                    ) and (Beatmap.deletedAt.isNull())
-                }
-                .complexToBeatmap()
-                .firstOrNull()
-                ?.run {
-                    MapDetail.from(this, cdnPrefix())
-                }
-        }
-
-        if (r == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(r)
-        }
-    }
-
-    get<MapsApi.BeatsaverDownload> { k ->
-        val r = try {
-            transaction {
+        mapsApiBeatsaverGetSlots.withPermit {
+            val r = transaction {
                 modelPostgresOperation()
                 Beatmap
                     .joinVersions(true)
+                    .joinUploader()
+                    .joinCurator()
                     .selectAll()
                     .where {
-                        Beatmap.id eq k.key.toInt(16) and (Beatmap.deletedAt.isNull())
+                        Beatmap.id.inSubQuery(
+                            Versions
+                                .select(Versions.mapId)
+                                .where {
+                                    Versions.key64 eq it.key
+                                }
+                                .limit(1)
+                        ) and (Beatmap.deletedAt.isNull())
                     }
                     .complexToBeatmap()
                     .firstOrNull()
                     ?.run {
                         MapDetail.from(this, cdnPrefix())
                     }
-            }?.publishedVersion()
-        } catch (_: NumberFormatException) {
-            null
-        }
+            }
 
-        if (r == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respondRedirect(r.downloadURL)
+            if (r == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(r)
+            }
+        }
+    }
+
+    get<MapsApi.BeatsaverDownload> { k ->
+        mapsApiBeatsaverDownloadGetSlots.withPermit {
+            val r = try {
+                transaction {
+                    modelPostgresOperation()
+                    Beatmap
+                        .joinVersions(true)
+                        .selectAll()
+                        .where {
+                            Beatmap.id eq k.key.toInt(16) and (Beatmap.deletedAt.isNull())
+                        }
+                        .complexToBeatmap()
+                        .firstOrNull()
+                        ?.run {
+                            MapDetail.from(this, cdnPrefix())
+                        }
+                }?.publishedVersion()
+            } catch (_: NumberFormatException) {
+                null
+            }
+
+            if (r == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respondRedirect(r.downloadURL)
+            }
         }
     }
 
     getWithOptions<MapsApi.ByIds>("Get maps for mapIds".responds(ok<MapDetail>(), notFound())) { ids ->
-        val sess = call.sessions.get<Session>()
-        val mapIdList = ids.ids.split(",").take(50)
-        val isAdmin = sess?.isAdmin() == true
-        val r = try {
-            transaction {
-                modelPostgresOperation()
-                Beatmap
-                    .joinVersions(true, state = null)
-                    .joinUploader()
-                    .joinCurator()
-                    .joinBookmarked(sess?.userId)
-                    .joinCollaborators()
-                    .selectAll()
-                    .where {
-                        Beatmap.id.inList(
-                            mapIdList.mapNotNull { id -> id.toIntOrNull(16) }
-                        ) and (Beatmap.deletedAt.isNull())
-                    }
-                    .complexToBeatmap()
-                    .map {
-                        MapDetail.from(it, cdnPrefix())
-                    }.filter {
-                        it.publishedVersion() != null || it.uploader.id == sess?.userId || sess?.testplay == true || isAdmin
-                    }
-                    .associateBy { it.id }
+        mapsApiByIdsGetSlots.withPermit {
+            val sess = call.sessions.get<Session>()
+            val mapIdList = ids.ids.split(",").take(50)
+            val isAdmin = sess?.isAdmin() == true
+            val r = try {
+                transaction {
+                    modelPostgresOperation()
+                    Beatmap
+                        .joinVersions(true, state = null)
+                        .joinUploader()
+                        .joinCurator()
+                        .joinBookmarked(sess?.userId)
+                        .joinCollaborators()
+                        .selectAll()
+                        .where {
+                            Beatmap.id.inList(
+                                mapIdList.mapNotNull { id -> id.toIntOrNull(16) }
+                            ) and (Beatmap.deletedAt.isNull())
+                        }
+                        .complexToBeatmap()
+                        .map {
+                            MapDetail.from(it, cdnPrefix())
+                        }.filter {
+                            it.publishedVersion() != null || it.uploader.id == sess?.userId || sess?.testplay == true || isAdmin
+                        }
+                        .associateBy { it.id }
+                }
+            } catch (_: NumberFormatException) {
+                null
             }
-        } catch (_: NumberFormatException) {
-            null
-        }
-        if (r == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(r)
+            if (r == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(r)
+            }
         }
     }
 
     getWithOptions<MapsApi.ByHash>("Get map(s) for a map hash".responds(ok<MapDetail>(), notFound())) {
-        val r = transaction {
-            modelPostgresOperation()
-            val rawHashes = it.hash.lowercase().split(',', ignoreCase = false).take(50)
-            val singleRequest = rawHashes.size <= 1
+        mapsApiByHashGetSlots.withPermit {
+            val r = transaction {
+                modelPostgresOperation()
+                val rawHashes = it.hash.lowercase().split(',', ignoreCase = false).take(50)
+                val singleRequest = rawHashes.size <= 1
 
-            val versions = Versions
-                .select(Versions.mapId, Versions.hash)
-                .where {
-                    Versions.hash.inList(rawHashes)
-                }
-            val versionMapping = versions.associate { it[Versions.hash] to it[Versions.mapId].value }
-            val mapIds = versionMapping.values.toHashSet()
+                val versions = Versions
+                    .select(Versions.mapId, Versions.hash)
+                    .where {
+                        Versions.hash.inList(rawHashes)
+                    }
+                val versionMapping = versions.associate { it[Versions.hash] to it[Versions.mapId].value }
+                val mapIds = versionMapping.values.toHashSet()
 
-            Beatmap
-                .joinVersions(true)
-                .joinUploader()
-                .joinCurator()
-                .joinCollaborators()
-                .selectAll()
-                .where {
-                    Beatmap.id.inList(mapIds) and (Beatmap.deletedAt.isNull())
-                }
-                .complexToBeatmap()
-                .map {
-                    MapDetail.from(it, cdnPrefix())
-                }.let { maps ->
-                    val assocMaps = maps.associateBy { it.id }
-                    when (singleRequest) {
-                        true -> maps.firstOrNull()
-                        else -> {
-                            rawHashes.associateWith {
-                                versionMapping[it]?.let { mapId ->
-                                    assocMaps[toHexString(mapId)]
+                Beatmap
+                    .joinVersions(true)
+                    .joinUploader()
+                    .joinCurator()
+                    .joinCollaborators()
+                    .selectAll()
+                    .where {
+                        Beatmap.id.inList(mapIds) and (Beatmap.deletedAt.isNull())
+                    }
+                    .complexToBeatmap()
+                    .map {
+                        MapDetail.from(it, cdnPrefix())
+                    }.let { maps ->
+                        val assocMaps = maps.associateBy { it.id }
+                        when (singleRequest) {
+                            true -> maps.firstOrNull()
+                            else -> {
+                                rawHashes.associateWith {
+                                    versionMapping[it]?.let { mapId ->
+                                        assocMaps[toHexString(mapId)]
+                                    }
                                 }
                             }
                         }
                     }
-                }
-        }
+            }
 
-        if (r == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(r)
+            if (r == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(r)
+            }
         }
     }
 
     get<MapsApi.WIP> { r ->
-        requireAuthorization { _, sess ->
+        mapsApiWIPGetSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val beatmaps = transaction {
+                    modelPostgresOperation()
+                    Beatmap
+                        .joinVersions(true, state = null)
+                        .joinUploader()
+                        .joinCurator()
+                        .joinBookmarked(sess.userId)
+                        .selectAll()
+                        .where {
+                            Beatmap.id.inSubQuery(
+                                Beatmap
+                                    .join(
+                                        Versions,
+                                        JoinType.LEFT,
+                                        onColumn = Beatmap.id,
+                                        otherColumn = Versions.mapId,
+                                        additionalConstraint = { Versions.state eq EMapState.Published }
+                                    )
+                                    .select(Beatmap.id)
+                                    .where {
+                                        Beatmap.uploader.eq(sess.userId) and Beatmap.deletedAt.isNull() and Versions.mapId.isNull()
+                                    }
+                                    .groupBy(Beatmap.id)
+                                    .orderBy(Beatmap.uploaded to SortOrder.DESC)
+                                    .limit(r.page.or(0))
+                            )
+                        }
+                        .complexToBeatmap()
+                        .map { map ->
+                            MapDetail.from(map, cdnPrefix())
+                        }
+                        .sortedByDescending { it.uploaded }
+                }
+
+                call.respond(SearchResponse(beatmaps))
+            }
+        }
+    }
+
+    getWithOptions<MapsApi.ByUploader>("Get maps by a user".responds(ok<SearchResponse>())) {
+        mapsApiByUploaderGetSlots.withPermit {
+            val sess = call.sessions.get<Session>()
             val beatmaps = transaction {
                 modelPostgresOperation()
                 Beatmap
-                    .joinVersions(true, state = null)
+                    .joinVersions(true)
                     .joinUploader()
                     .joinCurator()
-                    .joinBookmarked(sess.userId)
+                    .joinBookmarked(sess?.userId)
                     .selectAll()
                     .where {
                         Beatmap.id.inSubQuery(
                             Beatmap
-                                .join(
-                                    Versions,
-                                    JoinType.LEFT,
-                                    onColumn = Beatmap.id,
-                                    otherColumn = Versions.mapId,
-                                    additionalConstraint = { Versions.state eq EMapState.Published }
-                                )
+                                .joinVersions()
                                 .select(Beatmap.id)
                                 .where {
-                                    Beatmap.uploader.eq(sess.userId) and Beatmap.deletedAt.isNull() and Versions.mapId.isNull()
+                                    Beatmap.uploader.eq(it.id?.orNull()) and (Beatmap.deletedAt.isNull())
                                 }
-                                .groupBy(Beatmap.id)
                                 .orderBy(Beatmap.uploaded to SortOrder.DESC)
-                                .limit(r.page.or(0))
+                                .limit(it.page.or(0))
                         )
                     }
                     .complexToBeatmap()
@@ -862,69 +941,39 @@ fun Route.mapDetailRoute() {
         }
     }
 
-    getWithOptions<MapsApi.ByUploader>("Get maps by a user".responds(ok<SearchResponse>())) {
-        val sess = call.sessions.get<Session>()
-        val beatmaps = transaction {
-            modelPostgresOperation()
-            Beatmap
-                .joinVersions(true)
-                .joinUploader()
-                .joinCurator()
-                .joinBookmarked(sess?.userId)
-                .selectAll()
-                .where {
-                    Beatmap.id.inSubQuery(
-                        Beatmap
-                            .joinVersions()
-                            .select(Beatmap.id)
-                            .where {
-                                Beatmap.uploader.eq(it.id?.orNull()) and (Beatmap.deletedAt.isNull())
-                            }
-                            .orderBy(Beatmap.uploaded to SortOrder.DESC)
-                            .limit(it.page.or(0))
-                    )
-                }
-                .complexToBeatmap()
-                .map { map ->
-                    MapDetail.from(map, cdnPrefix())
-                }
-                .sortedByDescending { it.uploaded }
-        }
-
-        call.respond(SearchResponse(beatmaps))
-    }
-
     getWithOptions<MapsApi.Collaborations>("Get maps by a user, including collaborations".responds(ok<SearchResponse>())) {
-        val sess = call.sessions.get<Session>()
+        mapsApiCollaborationsGetSlots.withPermit {
+            val sess = call.sessions.get<Session>()
 
-        val results = SolrQuery().all()
-            .notNullOpt(it.before) { o -> BsSolr.uploaded less o }
-            .notNullOpt(it.id) { o -> BsSolr.mapperIds eq o }
-            .setSort(BsSolr.uploaded.desc())
-            .paged(pageSize = it.pageSize.or(20).coerceIn(1, 100))
-            .also { modelSolrOperation() }
-            .getIds(BsSolr, call = call)
+            val results = SolrQuery().all()
+                .notNullOpt(it.before) { o -> BsSolr.uploaded less o }
+                .notNullOpt(it.id) { o -> BsSolr.mapperIds eq o }
+                .setSort(BsSolr.uploaded.desc())
+                .paged(pageSize = it.pageSize.or(20).coerceIn(1, 100))
+                .also { modelSolrOperation() }
+                .getIds(BsSolr, call = call)
 
-        val beatmaps = newSuspendedTransaction {
-            modelPostgresOperation()
-            Beatmap
-                .joinVersions(true)
-                .joinUploader()
-                .joinCurator()
-                .joinBookmarked(sess?.userId)
-                .joinCollaborators()
-                .selectAll()
-                .where {
-                    Beatmap.id.inList(results.mapIds)
-                }
-                .complexToBeatmap()
-                .map { map ->
-                    MapDetail.from(map, cdnPrefix())
-                }
-                .sortedByDescending { it.uploaded }
+            val beatmaps = newSuspendedTransaction {
+                modelPostgresOperation()
+                Beatmap
+                    .joinVersions(true)
+                    .joinUploader()
+                    .joinCurator()
+                    .joinBookmarked(sess?.userId)
+                    .joinCollaborators()
+                    .selectAll()
+                    .where {
+                        Beatmap.id.inList(results.mapIds)
+                    }
+                    .complexToBeatmap()
+                    .map { map ->
+                        MapDetail.from(map, cdnPrefix())
+                    }
+                    .sortedByDescending { it.uploaded }
+            }
+
+            call.respond(SearchResponse(beatmaps, results.searchInfo))
         }
-
-        call.respond(SearchResponse(beatmaps, results.searchInfo))
     }
 
     getWithOptions<MapsApi.ByUploadDate>(
@@ -932,61 +981,63 @@ fun Route.mapDetailRoute() {
             ok<SearchResponse>()
         )
     ) {
-        val sess = call.sessions.get<Session>()
+        mapsApiByUploadDateGetSlots.withPermit {
+            val sess = call.sessions.get<Session>()
 
-        val sortField = when (it.sort?.orNull()) {
-            null, LatestSort.FIRST_PUBLISHED -> Beatmap.uploaded
-            LatestSort.UPDATED -> Beatmap.updatedAt
-            LatestSort.LAST_PUBLISHED -> Beatmap.lastPublishedAt
-            LatestSort.CREATED -> Beatmap.createdAt
-            LatestSort.CURATED -> Beatmap.curatedAt
-        }
+            val sortField = when (it.sort?.orNull()) {
+                null, LatestSort.FIRST_PUBLISHED -> Beatmap.uploaded
+                LatestSort.UPDATED -> Beatmap.updatedAt
+                LatestSort.LAST_PUBLISHED -> Beatmap.lastPublishedAt
+                LatestSort.CREATED -> Beatmap.createdAt
+                LatestSort.CURATED -> Beatmap.curatedAt
+            }
 
-        val beatmaps = transaction {
-            modelPostgresOperation()
-            Beatmap
-                .joinVersions(true)
-                .joinUploader()
-                .joinCurator()
-                .joinBookmarked(sess?.userId)
-                .selectAll()
-                .where {
-                    Beatmap.id.inSubQuery(
-                        Beatmap
-                            .joinVersions()
-                            .joinUploader()
-                            .select(Beatmap.id)
-                            .where {
-                                Beatmap.deletedAt.isNull()
-                                    .let { q ->
-                                        if (it.automapper != true) q.and(Beatmap.declaredAi eq AiDeclarationType.None) else q
-                                    }
-                                    .notNullOpt(it.before) { o -> sortField less o.toJavaInstant() }
-                                    .notNullOpt(it.after) { o -> sortField greater o.toJavaInstant() }
-                                    .let { q ->
-                                        if (it.sort?.orNull() == LatestSort.CURATED) q.and(Beatmap.curatedAt.isNotNull()) else q
-                                    }
-                            }
-                            .orderBy(sortField to (if (it.after?.orNull() != null) SortOrder.ASC else SortOrder.DESC))
-                            .limit(it.pageSize.or(20).coerceIn(1, 100))
-                    )
-                }
-                .complexToBeatmap()
-                .sortedByDescending { map ->
-                    when (it.sort?.orNull()) {
-                        null, LatestSort.FIRST_PUBLISHED -> map.uploaded
-                        LatestSort.UPDATED -> map.updatedAt
-                        LatestSort.LAST_PUBLISHED -> map.lastPublishedAt
-                        LatestSort.CREATED -> map.createdAt
-                        LatestSort.CURATED -> map.curatedAt
+            val beatmaps = transaction {
+                modelPostgresOperation()
+                Beatmap
+                    .joinVersions(true)
+                    .joinUploader()
+                    .joinCurator()
+                    .joinBookmarked(sess?.userId)
+                    .selectAll()
+                    .where {
+                        Beatmap.id.inSubQuery(
+                            Beatmap
+                                .joinVersions()
+                                .joinUploader()
+                                .select(Beatmap.id)
+                                .where {
+                                    Beatmap.deletedAt.isNull()
+                                        .let { q ->
+                                            if (it.automapper != true) q.and(Beatmap.declaredAi eq AiDeclarationType.None) else q
+                                        }
+                                        .notNullOpt(it.before) { o -> sortField less o.toJavaInstant() }
+                                        .notNullOpt(it.after) { o -> sortField greater o.toJavaInstant() }
+                                        .let { q ->
+                                            if (it.sort?.orNull() == LatestSort.CURATED) q.and(Beatmap.curatedAt.isNotNull()) else q
+                                        }
+                                }
+                                .orderBy(sortField to (if (it.after?.orNull() != null) SortOrder.ASC else SortOrder.DESC))
+                                .limit(it.pageSize.or(20).coerceIn(1, 100))
+                        )
                     }
-                }
-                .map { map ->
-                    MapDetail.from(map, cdnPrefix())
-                }
-        }
+                    .complexToBeatmap()
+                    .sortedByDescending { map ->
+                        when (it.sort?.orNull()) {
+                            null, LatestSort.FIRST_PUBLISHED -> map.uploaded
+                            LatestSort.UPDATED -> map.updatedAt
+                            LatestSort.LAST_PUBLISHED -> map.lastPublishedAt
+                            LatestSort.CREATED -> map.createdAt
+                            LatestSort.CURATED -> map.curatedAt
+                        }
+                    }
+                    .map { map ->
+                        MapDetail.from(map, cdnPrefix())
+                    }
+            }
 
-        call.respond(SearchResponse(beatmaps))
+            call.respond(SearchResponse(beatmaps))
+        }
     }
 
     getWithOptions<MapsApi.Deleted>(
@@ -994,58 +1045,62 @@ fun Route.mapDetailRoute() {
             ok<DeletedResponse>()
         )
     ) {
-        val sortField = Beatmap.deletedAt
-        val beatmaps = transaction {
-            modelPostgresOperation()
-            Beatmap
-                .select(Beatmap.id, Beatmap.deletedAt)
-                .where {
-                    Beatmap.deletedAt.isNotNull()
-                        .notNullOpt(it.before) { o -> sortField less o.toJavaInstant() }
-                        .notNullOpt(it.after) { o -> sortField greater o.toJavaInstant() }
-                }
-                .orderBy(sortField to (if (it.after?.orNull() != null) SortOrder.ASC else SortOrder.DESC))
-                .limit(it.pageSize.or(20).coerceIn(1, 100))
-                .mapNotNull { map ->
-                    val instant = map[Beatmap.deletedAt]
-                    if (instant == null) {
-                        null
-                    } else {
-                        DeletedMap(toHexString(map[Beatmap.id].value), instant.toKotlinInstant())
+        mapsApiDeletedGetSlots.withPermit {
+            val sortField = Beatmap.deletedAt
+            val beatmaps = transaction {
+                modelPostgresOperation()
+                Beatmap
+                    .select(Beatmap.id, Beatmap.deletedAt)
+                    .where {
+                        Beatmap.deletedAt.isNotNull()
+                            .notNullOpt(it.before) { o -> sortField less o.toJavaInstant() }
+                            .notNullOpt(it.after) { o -> sortField greater o.toJavaInstant() }
                     }
-                }
-                .sortedByDescending { map -> map.deletedAt }
-        }
+                    .orderBy(sortField to (if (it.after?.orNull() != null) SortOrder.ASC else SortOrder.DESC))
+                    .limit(it.pageSize.or(20).coerceIn(1, 100))
+                    .mapNotNull { map ->
+                        val instant = map[Beatmap.deletedAt]
+                        if (instant == null) {
+                            null
+                        } else {
+                            DeletedMap(toHexString(map[Beatmap.id].value), instant.toKotlinInstant())
+                        }
+                    }
+                    .sortedByDescending { map -> map.deletedAt }
+            }
 
-        call.respond(DeletedResponse(beatmaps))
+            call.respond(DeletedResponse(beatmaps))
+        }
     }
 
     getWithOptions<MapsApi.ByPlayCount>("Get maps ordered by play count (Not currently tracked)".responds(ok<SearchResponse>())) {
-        val beatmaps = transaction {
-            modelPostgresOperation()
-            Beatmap
-                .joinVersions(true)
-                .joinUploader()
-                .joinCurator()
-                .selectAll()
-                .where {
-                    Beatmap.id.inSubQuery(
-                        Beatmap
-                            .select(Beatmap.id)
-                            .where {
-                                Beatmap.deletedAt.isNull()
-                            }
-                            .orderBy(Beatmap.plays to SortOrder.DESC)
-                            .limit(it.page.or(0))
-                    )
-                }
-                .complexToBeatmap()
-                .map {
-                    MapDetail.from(it, cdnPrefix())
-                }
-                .sortedByDescending { it.stats.plays }
-        }
+        mapsApiByPlayCountGetSlots.withPermit {
+            val beatmaps = transaction {
+                modelPostgresOperation()
+                Beatmap
+                    .joinVersions(true)
+                    .joinUploader()
+                    .joinCurator()
+                    .selectAll()
+                    .where {
+                        Beatmap.id.inSubQuery(
+                            Beatmap
+                                .select(Beatmap.id)
+                                .where {
+                                    Beatmap.deletedAt.isNull()
+                                }
+                                .orderBy(Beatmap.plays to SortOrder.DESC)
+                                .limit(it.page.or(0))
+                        )
+                    }
+                    .complexToBeatmap()
+                    .map {
+                        MapDetail.from(it, cdnPrefix())
+                    }
+                    .sortedByDescending { it.stats.plays }
+            }
 
-        call.respond(SearchResponse(beatmaps))
+            call.respond(SearchResponse(beatmaps))
+        }
     }
 }

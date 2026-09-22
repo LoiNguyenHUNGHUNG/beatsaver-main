@@ -51,6 +51,9 @@ import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 
+private val verifyGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val steamGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 @Serializable
 data class Session(
     val userId: Int,
@@ -175,37 +178,39 @@ fun Route.authRoute(client: HttpClient) {
     get<Reset> { genericPage() }
 
     get<Verify> { req ->
-        val valid = try {
-            val trusted = Jwts.parserBuilder()
-                .require("action", "register")
-                .setSigningKey(UserCrypto.key())
-                .build()
-                .parseClaimsJws(req.jwt)
+        verifyGetSlots.withPermit {
+            val valid = try {
+                val trusted = Jwts.parserBuilder()
+                    .require("action", "register")
+                    .setSigningKey(UserCrypto.key())
+                    .build()
+                    .parseClaimsJws(req.jwt)
 
-            trusted.body.subject.toInt().let { userId ->
-                transaction {
-                    modelPostgresOperation()
-                    User.update({
-                        (User.id eq userId) and User.verifyToken.isNotNull()
-                    }) {
-                        it[active] = true
-                        it[verifyToken] = null
-                        it[updatedAt] = NowExpression(updatedAt)
-                    } > 0
-                }.also {
-                    if (it) {
-                        modelRabbitMqOperation()
-                        call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                trusted.body.subject.toInt().let { userId ->
+                    transaction {
+                        modelPostgresOperation()
+                        User.update({
+                            (User.id eq userId) and User.verifyToken.isNotNull()
+                        }) {
+                            it[active] = true
+                            it[verifyToken] = null
+                            it[updatedAt] = NowExpression(updatedAt)
+                        } > 0
+                    }.also {
+                        if (it) {
+                            modelRabbitMqOperation()
+                            call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                        }
                     }
                 }
+            } catch (e: SignatureException) {
+                false
+            } catch (e: JwtException) {
+                false
             }
-        } catch (e: SignatureException) {
-            false
-        } catch (e: JwtException) {
-            false
-        }
 
-        call.respondRedirect("/login" + if (valid) "?valid" else "")
+            call.respondRedirect("/login" + if (valid) "?valid" else "")
+        }
     }
 
     authenticate("auth-form") {
@@ -274,50 +279,52 @@ fun Route.authRoute(client: HttpClient) {
     }
 
     get<Steam> {
-        val sess = call.sessions.get<Session>()
-        if (sess == null) {
-            call.respondRedirect("/")
-            return@get
-        }
-
-        val queryParams = call.request.queryParameters as StringValues
-        val claimedId = queryParams["openid.claimed_id"]
-
-        if (claimedId == null) {
-            val params = parametersOf(
-                "openid.ns" to listOf("http://specs.openid.net/auth/2.0"),
-                "openid.mode" to listOf("checkid_setup"),
-                "openid.return_to" to listOf("${Config.siteBase()}/steam"),
-                "openid.realm" to listOf(Config.siteBase()),
-                "openid.identity" to listOf("http://specs.openid.net/auth/2.0/identifier_select"),
-                "openid.claimed_id" to listOf("http://specs.openid.net/auth/2.0/identifier_select")
-            )
-
-            val url = URLBuilder(protocol = URLProtocol.HTTPS, host = "steamcommunity.com", pathSegments = listOf("openid", "login"), parameters = params).buildString()
-            // val url = Url(URLProtocol.HTTPS, "steamcommunity.com", 0, "/openid/login", params, "", null, null, false).toString()
-            call.respondRedirect(url)
-        } else {
-            val xml = steamLoginSlots.withPermit {
-                validateSteamOpenId(client, queryParams)
-            }
-            val valid = Regex("is_valid\\s*:\\s*true", RegexOption.IGNORE_CASE).containsMatchIn(xml)
-            if (!valid) {
-                throw RuntimeException("Invalid openid response 1")
+        steamGetSlots.withPermit {
+            val sess = call.sessions.get<Session>()
+            if (sess == null) {
+                call.respondRedirect("/")
+                return@get
             }
 
-            val matches = Regex("^https?:\\/\\/steamcommunity\\.com\\/openid\\/id\\/(7[0-9]{15,25}+)\$").matchEntire(claimedId)?.groupValues
-                ?: throw RuntimeException("Invalid openid response 2")
-            val steamid = matches[1].toLong()
+            val queryParams = call.request.queryParameters as StringValues
+            val claimedId = queryParams["openid.claimed_id"]
 
-            transaction {
-                modelPostgresOperation()
-                User.update({ User.id eq sess.userId }) {
-                    it[steamId] = steamid
-                    it[updatedAt] = NowExpression(updatedAt)
+            if (claimedId == null) {
+                val params = parametersOf(
+                    "openid.ns" to listOf("http://specs.openid.net/auth/2.0"),
+                    "openid.mode" to listOf("checkid_setup"),
+                    "openid.return_to" to listOf("${Config.siteBase()}/steam"),
+                    "openid.realm" to listOf(Config.siteBase()),
+                    "openid.identity" to listOf("http://specs.openid.net/auth/2.0/identifier_select"),
+                    "openid.claimed_id" to listOf("http://specs.openid.net/auth/2.0/identifier_select")
+                )
+
+                val url = URLBuilder(protocol = URLProtocol.HTTPS, host = "steamcommunity.com", pathSegments = listOf("openid", "login"), parameters = params).buildString()
+                // val url = Url(URLProtocol.HTTPS, "steamcommunity.com", 0, "/openid/login", params, "", null, null, false).toString()
+                call.respondRedirect(url)
+            } else {
+                val xml = steamLoginSlots.withPermit {
+                    validateSteamOpenId(client, queryParams)
                 }
+                val valid = Regex("is_valid\\s*:\\s*true", RegexOption.IGNORE_CASE).containsMatchIn(xml)
+                if (!valid) {
+                    throw RuntimeException("Invalid openid response 1")
+                }
+
+                val matches = Regex("^https?:\\/\\/steamcommunity\\.com\\/openid\\/id\\/(7[0-9]{15,25}+)\$").matchEntire(claimedId)?.groupValues
+                    ?: throw RuntimeException("Invalid openid response 2")
+                val steamid = matches[1].toLong()
+
+                transaction {
+                    modelPostgresOperation()
+                    User.update({ User.id eq sess.userId }) {
+                        it[steamId] = steamid
+                        it[updatedAt] = NowExpression(updatedAt)
+                    }
+                }
+                call.sessions.set(sess.copy(steamId = steamid))
+                call.respondRedirect("/profile")
             }
-            call.sessions.set(sess.copy(steamId = steamid))
-            call.respondRedirect("/profile")
         }
     }
 }

@@ -83,6 +83,16 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import java.lang.Integer.toHexString
 
+private val reviewApiByDateGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val reviewApiDetailGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val reviewApiByMapGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val reviewApiByUserGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val reviewApiSingleGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val reviewApiSingleDeleteSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val reviewApiCuratePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val replyApiSingleDeleteSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val replyApiByDateGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun ReviewDetail.Companion.from(other: ReviewDao, cdnPrefix: String, beatmap: Boolean = true, user: Boolean = true) =
     ReviewDetail(
         other.id.value,
@@ -270,187 +280,197 @@ private val replyUpdateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Route.reviewRoute(client: HttpClient) {
     get<ReviewApi.ByDate> {
-        val reviews = transaction {
-            modelPostgresOperation()
-            try {
-                Review
-                    .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
-                    .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                    .joinVersions(false)
-                    .joinUploader()
-                    .joinCurator()
-                    .selectAll()
-                    .where {
-                        Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
-                            .notNullOpt(it.before) { o -> Review.createdAt less o.toJavaInstant() }
-                            .notNull(it.user) { u -> reviewerAlias[User.uniqueName] eq u }
-                    }
-                    .orderBy(
-                        Review.createdAt to SortOrder.DESC
-                    )
-                    .limit(it.page.or(0))
-                    .complexToReview()
-                    .map { ReviewDetail.from(it, cdnPrefix()) }
-            } catch (_: NumberFormatException) {
-                null
+        reviewApiByDateGetSlots.withPermit {
+            val reviews = transaction {
+                modelPostgresOperation()
+                try {
+                    Review
+                        .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
+                        .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                        .joinVersions(false)
+                        .joinUploader()
+                        .joinCurator()
+                        .selectAll()
+                        .where {
+                            Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
+                                .notNullOpt(it.before) { o -> Review.createdAt less o.toJavaInstant() }
+                                .notNull(it.user) { u -> reviewerAlias[User.uniqueName] eq u }
+                        }
+                        .orderBy(
+                            Review.createdAt to SortOrder.DESC
+                        )
+                        .limit(it.page.or(0))
+                        .complexToReview()
+                        .map { ReviewDetail.from(it, cdnPrefix()) }
+                } catch (_: NumberFormatException) {
+                    null
+                }
             }
-        }
 
-        if (reviews == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(ReviewsResponse(reviews))
+            if (reviews == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(ReviewsResponse(reviews))
+            }
         }
     }
 
     get<ReviewApi.Detail> {
-        val review = transaction {
-            modelPostgresOperation()
-            try {
-                Review
-                    .joinReplies()
-                    .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                    .joinVersions(false)
-                    .select(Review.columns + ReviewReply.columns)
-                    .where {
-                        Review.id eq it.reviewId?.orNull() and Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
-                    }
-                    .orderBy(
-                        ReviewReply.createdAt to SortOrder.ASC
-                    )
-                    .complexToReview()
-                    .singleOrNull()
-                    ?.let { ReviewDetail.from(it, cdnPrefix()) }
-            } catch (_: NumberFormatException) {
-                null
+        reviewApiDetailGetSlots.withPermit {
+            val review = transaction {
+                modelPostgresOperation()
+                try {
+                    Review
+                        .joinReplies()
+                        .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                        .joinVersions(false)
+                        .select(Review.columns + ReviewReply.columns)
+                        .where {
+                            Review.id eq it.reviewId?.orNull() and Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
+                        }
+                        .orderBy(
+                            ReviewReply.createdAt to SortOrder.ASC
+                        )
+                        .complexToReview()
+                        .singleOrNull()
+                        ?.let { ReviewDetail.from(it, cdnPrefix()) }
+                } catch (_: NumberFormatException) {
+                    null
+                }
             }
-        }
 
-        if (review == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(review)
+            if (review == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(review)
+            }
         }
     }
 
     get<ReviewApi.ByMap> {
-        val reviews = transaction {
-            modelPostgresOperation()
-            try {
-                Review
-                    .joinReplies()
-                    .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                    .joinVersions()
-                    .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
-                    .select(Review.columns + ReviewReply.columns + reviewerAlias.columns)
-                    .where {
-                        Review.id.inSubQuery(
-                            Review
-                                .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                                .joinVersions()
-                                .select(Review.id)
-                                .where {
-                                    Review.mapId eq it.id.toInt(16) and Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
-                                }
-                                .orderBy(
-                                    Review.curatedAt to SortOrder.DESC_NULLS_LAST,
-                                    Review.createdAt to SortOrder.DESC
-                                )
-                                .limit(it.page.or(0))
+        reviewApiByMapGetSlots.withPermit {
+            val reviews = transaction {
+                modelPostgresOperation()
+                try {
+                    Review
+                        .joinReplies()
+                        .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                        .joinVersions()
+                        .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
+                        .select(Review.columns + ReviewReply.columns + reviewerAlias.columns)
+                        .where {
+                            Review.id.inSubQuery(
+                                Review
+                                    .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                                    .joinVersions()
+                                    .select(Review.id)
+                                    .where {
+                                        Review.mapId eq it.id.toInt(16) and Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
+                                    }
+                                    .orderBy(
+                                        Review.curatedAt to SortOrder.DESC_NULLS_LAST,
+                                        Review.createdAt to SortOrder.DESC
+                                    )
+                                    .limit(it.page.or(0))
+                            )
+                        }
+                        .orderBy(
+                            Review.curatedAt to SortOrder.DESC_NULLS_LAST,
+                            Review.createdAt to SortOrder.DESC,
+                            ReviewReply.createdAt to SortOrder.ASC
                         )
-                    }
-                    .orderBy(
-                        Review.curatedAt to SortOrder.DESC_NULLS_LAST,
-                        Review.createdAt to SortOrder.DESC,
-                        ReviewReply.createdAt to SortOrder.ASC
-                    )
-                    .complexToReview()
-                    .map {
-                        ReviewDetail.from(it, cdnPrefix(), beatmap = false)
-                    }
-            } catch (_: NumberFormatException) {
-                null
+                        .complexToReview()
+                        .map {
+                            ReviewDetail.from(it, cdnPrefix(), beatmap = false)
+                        }
+                } catch (_: NumberFormatException) {
+                    null
+                }
             }
-        }
 
-        if (reviews == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(ReviewsResponse(reviews))
+            if (reviews == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(ReviewsResponse(reviews))
+            }
         }
     }
 
     get<ReviewApi.ByUser> {
-        val reviews = transaction {
-            modelPostgresOperation()
-            try {
-                Review
-                    .joinReplies()
-                    .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                    .joinVersions()
-                    .joinUploader()
-                    .joinCurator()
-                    .selectAll()
-                    .where {
-                        Review.id.inSubQuery(
-                            Review
-                                .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                                .joinVersions()
-                                .select(Review.id)
-                                .where {
-                                    Review.userId eq it.id?.orNull() and Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
-                                }
-                                .orderBy(Review.createdAt to SortOrder.DESC)
-                                .limit(it.page.or(0))
+        reviewApiByUserGetSlots.withPermit {
+            val reviews = transaction {
+                modelPostgresOperation()
+                try {
+                    Review
+                        .joinReplies()
+                        .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                        .joinVersions()
+                        .joinUploader()
+                        .joinCurator()
+                        .selectAll()
+                        .where {
+                            Review.id.inSubQuery(
+                                Review
+                                    .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                                    .joinVersions()
+                                    .select(Review.id)
+                                    .where {
+                                        Review.userId eq it.id?.orNull() and Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
+                                    }
+                                    .orderBy(Review.createdAt to SortOrder.DESC)
+                                    .limit(it.page.or(0))
+                            )
+                        }
+                        .orderBy(
+                            Review.createdAt to SortOrder.DESC,
+                            ReviewReply.createdAt to SortOrder.ASC
                         )
-                    }
-                    .orderBy(
-                        Review.createdAt to SortOrder.DESC,
-                        ReviewReply.createdAt to SortOrder.ASC
-                    )
-                    .complexToReview()
-                    .map {
-                        ReviewDetail.from(it, cdnPrefix(), user = false)
-                    }
-            } catch (_: NumberFormatException) {
-                null
+                        .complexToReview()
+                        .map {
+                            ReviewDetail.from(it, cdnPrefix(), user = false)
+                        }
+                } catch (_: NumberFormatException) {
+                    null
+                }
             }
-        }
 
-        if (reviews == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(ReviewsResponse(reviews))
+            if (reviews == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(ReviewsResponse(reviews))
+            }
         }
     }
 
     get<ReviewApi.Single> {
-        val review = transaction {
-            modelPostgresOperation()
-            try {
-                Review
-                    .joinReplies()
-                    .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                    .joinVersions(false)
-                    .select(Review.columns + ReviewReply.columns)
-                    .where {
-                        Review.mapId eq it.mapId.toInt(16) and (Review.userId eq it.userId?.orNull()) and Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
-                    }
-                    .orderBy(
-                        ReviewReply.createdAt to SortOrder.ASC
-                    )
-                    .complexToReview()
-                    .singleOrNull()
-                    ?.let { ReviewDetail.from(it, cdnPrefix()) }
-            } catch (_: NumberFormatException) {
-                null
+        reviewApiSingleGetSlots.withPermit {
+            val review = transaction {
+                modelPostgresOperation()
+                try {
+                    Review
+                        .joinReplies()
+                        .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                        .joinVersions(false)
+                        .select(Review.columns + ReviewReply.columns)
+                        .where {
+                            Review.mapId eq it.mapId.toInt(16) and (Review.userId eq it.userId?.orNull()) and Review.deletedAt.isNull() and Beatmap.deletedAt.isNull()
+                        }
+                        .orderBy(
+                            ReviewReply.createdAt to SortOrder.ASC
+                        )
+                        .complexToReview()
+                        .singleOrNull()
+                        ?.let { ReviewDetail.from(it, cdnPrefix()) }
+                } catch (_: NumberFormatException) {
+                    null
+                }
             }
-        }
 
-        if (review == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(review)
+            if (review == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(review)
+            }
         }
     }
 
@@ -572,85 +592,89 @@ fun Route.reviewRoute(client: HttpClient) {
     }
 
     delete<ReviewApi.Single> { single ->
-        requireAuthorization { _, sess ->
-            val deleteReview = call.receive<DeleteReview>()
-            val mapId = single.mapId.toInt(16)
-            val reqUid = single.userId?.orNull()
+        reviewApiSingleDeleteSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val deleteReview = call.receive<DeleteReview>()
+                val mapId = single.mapId.toInt(16)
+                val reqUid = single.userId?.orNull()
 
-            if (reqUid == null || (reqUid != sess.userId && !sess.isCurator())) {
-                call.respond(HttpStatusCode.Forbidden, ActionResponse.error())
-                return@requireAuthorization
-            }
+                if (reqUid == null || (reqUid != sess.userId && !sess.isCurator())) {
+                    call.respond(HttpStatusCode.Forbidden, ActionResponse.error())
+                    return@requireAuthorization
+                }
 
-            transaction {
-                modelPostgresOperation()
-                val result = Review.updateReturning({ Review.mapId eq mapId and (Review.userId eq reqUid) and Review.deletedAt.isNull() }, { r ->
-                    r[deletedAt] = NowExpression(deletedAt)
-                }, Review.id, Review.text, Review.sentiment)
+                transaction {
+                    modelPostgresOperation()
+                    val result = Review.updateReturning({ Review.mapId eq mapId and (Review.userId eq reqUid) and Review.deletedAt.isNull() }, { r ->
+                        r[deletedAt] = NowExpression(deletedAt)
+                    }, Review.id, Review.text, Review.sentiment)
 
-                if (!result.isNullOrEmpty()) {
-                    ReviewReply.deleteWhere { reviewId inList result.map { it[Review.id] } }
+                    if (!result.isNullOrEmpty()) {
+                        ReviewReply.deleteWhere { reviewId inList result.map { it[Review.id] } }
 
-                    if (reqUid != sess.userId) {
-                        val info = result.first().let {
-                            it[Review.text] to it[Review.sentiment]
+                        if (reqUid != sess.userId) {
+                            val info = result.first().let {
+                                it[Review.text] to it[Review.sentiment]
+                            }
+
+                            ModLog.insert(
+                                sess.userId,
+                                mapId,
+                                ReviewDeleteData(deleteReview.reason, info.first, info.second),
+                                reqUid
+                            )
+
+                            Alert.insert(
+                                "Your review was deleted",
+                                "A moderator deleted your review on #${toHexString(mapId)}.\n" +
+                                    "Reason: *\"${deleteReview.reason}\"*",
+                                EAlertType.ReviewDeletion,
+                                reqUid
+                            )
+                            updateAlertCount(reqUid)
                         }
-
-                        ModLog.insert(
-                            sess.userId,
-                            mapId,
-                            ReviewDeleteData(deleteReview.reason, info.first, info.second),
-                            reqUid
-                        )
-
-                        Alert.insert(
-                            "Your review was deleted",
-                            "A moderator deleted your review on #${toHexString(mapId)}.\n" +
-                                "Reason: *\"${deleteReview.reason}\"*",
-                            EAlertType.ReviewDeletion,
-                            reqUid
-                        )
-                        updateAlertCount(reqUid)
                     }
                 }
+
+                modelRabbitMqOperation()
+
+                call.pub("beatmaps", "reviews.$mapId.deleted", null, ReviewUpdateInfo(mapId, reqUid))
+                call.respond(HttpStatusCode.OK)
             }
-
-            modelRabbitMqOperation()
-
-            call.pub("beatmaps", "reviews.$mapId.deleted", null, ReviewUpdateInfo(mapId, reqUid))
-            call.respond(HttpStatusCode.OK)
         }
     }
 
     post<ReviewApi.Curate> {
-        requireAuthorization { _, user ->
-            if (!user.isCurator()) {
-                call.respond(HttpStatusCode.BadRequest)
-            } else {
-                val reviewUpdate = call.receive<CurateReview>()
+        reviewApiCuratePostSlots.withPermit {
+            requireAuthorization { _, user ->
+                if (!user.isCurator()) {
+                    call.respond(HttpStatusCode.BadRequest)
+                } else {
+                    val reviewUpdate = call.receive<CurateReview>()
 
-                transaction {
-                    modelPostgresOperation()
-                    fun curateReview() =
-                        Review.updateReturning({
-                            (Review.id eq reviewUpdate.id) and (if (reviewUpdate.curated) Review.curatedAt.isNull() else Review.curatedAt.isNotNull()) and Review.deletedAt.isNull()
-                        }, {
-                            if (reviewUpdate.curated) {
-                                it[curatedAt] = NowExpression(curatedAt)
-                            } else {
-                                it[curatedAt] = null
-                            }
-                        }, Review.mapId, Review.userId)
-                            ?.singleOrNull()
-                            ?.let { ReviewUpdateInfo(it[Review.mapId].value, it[Review.userId].value) }
+                    transaction {
+                        modelPostgresOperation()
+                        fun curateReview() =
+                            Review.updateReturning({
+                                (Review.id eq reviewUpdate.id) and (if (reviewUpdate.curated) Review.curatedAt.isNull() else Review.curatedAt.isNotNull()) and Review.deletedAt.isNull()
+                            }, {
+                                if (reviewUpdate.curated) {
+                                    it[curatedAt] = NowExpression(curatedAt)
+                                } else {
+                                    it[curatedAt] = null
+                                }
+                            }, Review.mapId, Review.userId)
+                                ?.singleOrNull()
+                                ?.let { ReviewUpdateInfo(it[Review.mapId].value, it[Review.userId].value) }
 
-                    curateReview()
-                }?.let {
-                    modelRabbitMqOperation()
-                    call.pub("beatmaps", "reviews.${it.mapId}.curated", null, it)
+                        curateReview()
+                    }?.let {
+                        modelRabbitMqOperation()
+                        call.pub("beatmaps", "reviews.${it.mapId}.curated", null, it)
+                    }
+
+                    call.respond(HttpStatusCode.OK)
                 }
-
-                call.respond(HttpStatusCode.OK)
             }
         }
     }
@@ -830,103 +854,107 @@ fun Route.reviewRoute(client: HttpClient) {
     }
 
     delete<ReplyApi.Single> { req ->
-        val delete = call.receive<DeleteReview>()
-        val replyId = req.replyId?.orNull() ?: throw UserApiException("Reply id missing")
+        replyApiSingleDeleteSlots.withPermit {
+            val delete = call.receive<DeleteReview>()
+            val replyId = req.replyId?.orNull() ?: throw UserApiException("Reply id missing")
 
-        requireAuthorization { _, user ->
-            val response = newSuspendedTransaction {
-                modelPostgresOperation()
-                val ownerId = ReviewReply
-                    .select(ReviewReply.userId)
-                    .where { ReviewReply.id eq replyId }
-                    .single().let { it[ReviewReply.userId].value }
+            requireAuthorization { _, user ->
+                val response = newSuspendedTransaction {
+                    modelPostgresOperation()
+                    val ownerId = ReviewReply
+                        .select(ReviewReply.userId)
+                        .where { ReviewReply.id eq replyId }
+                        .single().let { it[ReviewReply.userId].value }
 
-                if (ownerId != user.userId && !user.isCurator()) {
-                    return@newSuspendedTransaction HttpStatusCode.Unauthorized
-                }
+                    if (ownerId != user.userId && !user.isCurator()) {
+                        return@newSuspendedTransaction HttpStatusCode.Unauthorized
+                    }
 
-                val deleted = ReviewReply
-                    .updateReturning({
-                        ReviewReply.id eq replyId and ReviewReply.deletedAt.isNull()
-                    }, {
-                        it[deletedAt] = NowExpression(deletedAt)
-                    }, *ReviewReply.columns.toTypedArray())?.firstOrNull()
+                    val deleted = ReviewReply
+                        .updateReturning({
+                            ReviewReply.id eq replyId and ReviewReply.deletedAt.isNull()
+                        }, {
+                            it[deletedAt] = NowExpression(deletedAt)
+                        }, *ReviewReply.columns.toTypedArray())?.firstOrNull()
 
-                deleted?.let { d ->
-                    if (ownerId != user.userId) {
-                        val mapId = Review
-                            .select(Review.mapId)
-                            .where { Review.id eq d[ReviewReply.reviewId] }
-                            .single().let { it[Review.mapId].value }
+                    deleted?.let { d ->
+                        if (ownerId != user.userId) {
+                            val mapId = Review
+                                .select(Review.mapId)
+                                .where { Review.id eq d[ReviewReply.reviewId] }
+                                .single().let { it[Review.mapId].value }
 
-                        ModLog.insert(
-                            user.userId,
-                            mapId,
-                            ReplyDeleteData(delete.reason, d[ReviewReply.text]),
-                            ownerId
-                        )
+                            ModLog.insert(
+                                user.userId,
+                                mapId,
+                                ReplyDeleteData(delete.reason, d[ReviewReply.text]),
+                                ownerId
+                            )
 
-                        Alert.insert(
-                            "Your reply was deleted",
-                            "A moderator deleted your reply on #${toHexString(mapId)}.\n" +
-                                "Reason: *\"${delete.reason}\"*",
-                            EAlertType.ReviewDeletion,
-                            d[ReviewReply.userId].value
-                        )
-                        updateAlertCount(d[ReviewReply.userId].value)
+                            Alert.insert(
+                                "Your reply was deleted",
+                                "A moderator deleted your reply on #${toHexString(mapId)}.\n" +
+                                    "Reason: *\"${delete.reason}\"*",
+                                EAlertType.ReviewDeletion,
+                                d[ReviewReply.userId].value
+                            )
+                            updateAlertCount(d[ReviewReply.userId].value)
+                        }
+                    }
+
+                    // This can be inside the delete transaction since only the ID is needed and no data is retrieved
+                    if (deleted != null) {
+                        modelRabbitMqOperation()
+                        call.pub("beatmaps", "ws.review-replies.deleted", null, deleted[ReviewReply.id].value)
+                        HttpStatusCode.OK
+                    } else {
+                        HttpStatusCode.NotModified
                     }
                 }
 
-                // This can be inside the delete transaction since only the ID is needed and no data is retrieved
-                if (deleted != null) {
-                    modelRabbitMqOperation()
-                    call.pub("beatmaps", "ws.review-replies.deleted", null, deleted[ReviewReply.id].value)
-                    HttpStatusCode.OK
-                } else {
-                    HttpStatusCode.NotModified
-                }
+                call.respond(response)
             }
-
-            call.respond(response)
         }
     }
 
     get<ReplyApi.ByDate> {
-        val replies = transaction {
-            modelPostgresOperation()
-            try {
-                ReviewReply
-                    .join(reviewerAlias, JoinType.INNER, ReviewReply.userId, reviewerAlias[User.id])
-                    .join(Review, JoinType.INNER, ReviewReply.reviewId, Review.id)
-                    .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                    .selectAll()
-                    .where {
-                        ReviewReply.deletedAt.isNull() and Beatmap.deletedAt.isNull()
-                            .notNullOpt(it.before) { o -> ReviewReply.createdAt less o.toJavaInstant() }
-                            .notNull(it.user) { u -> reviewerAlias[User.uniqueName] eq u }
-                    }
-                    .orderBy(
-                        ReviewReply.createdAt to SortOrder.DESC
-                    )
-                    .limit(it.page.or(0))
-                    .complexToReview()
-                    .map { r -> ReviewDetail.from(r, cdnPrefix()) }
-                    .flatMap { review ->
-                        review.replies.map { reply ->
-                            reply.apply {
-                                this.review = review.copy(replies = listOf())
+        replyApiByDateGetSlots.withPermit {
+            val replies = transaction {
+                modelPostgresOperation()
+                try {
+                    ReviewReply
+                        .join(reviewerAlias, JoinType.INNER, ReviewReply.userId, reviewerAlias[User.id])
+                        .join(Review, JoinType.INNER, ReviewReply.reviewId, Review.id)
+                        .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                        .selectAll()
+                        .where {
+                            ReviewReply.deletedAt.isNull() and Beatmap.deletedAt.isNull()
+                                .notNullOpt(it.before) { o -> ReviewReply.createdAt less o.toJavaInstant() }
+                                .notNull(it.user) { u -> reviewerAlias[User.uniqueName] eq u }
+                        }
+                        .orderBy(
+                            ReviewReply.createdAt to SortOrder.DESC
+                        )
+                        .limit(it.page.or(0))
+                        .complexToReview()
+                        .map { r -> ReviewDetail.from(r, cdnPrefix()) }
+                        .flatMap { review ->
+                            review.replies.map { reply ->
+                                reply.apply {
+                                    this.review = review.copy(replies = listOf())
+                                }
                             }
                         }
-                    }
-            } catch (_: NumberFormatException) {
-                null
+                } catch (_: NumberFormatException) {
+                    null
+                }
             }
-        }
 
-        if (replies == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(RepliesResponse(replies))
+            if (replies == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(RepliesResponse(replies))
+            }
         }
     }
 }

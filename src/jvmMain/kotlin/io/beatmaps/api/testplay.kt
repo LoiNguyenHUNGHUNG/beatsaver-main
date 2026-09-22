@@ -70,6 +70,13 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import java.time.Instant
 
+private val testplayApiQueuePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val testplayApiQueueGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val testplayApiRecentGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val testplayApiStatePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val testplayApiVersionPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val testplayApiMarkPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 @Resource("/api/testplay")
 class TestplayApi {
     @Resource("/queue/{page}")
@@ -215,108 +222,118 @@ private val testplayFeedbackSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Route.testplayRoute(client: HttpClient) {
     post<TestplayApi.Queue> { req ->
-        requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
-            call.respond(getTestplayQueue(sess.userId, false, req.page.or(0)))
+        testplayApiQueuePostSlots.withPermit {
+            requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
+                call.respond(getTestplayQueue(sess.userId, false, req.page.or(0)))
+            }
         }
     }
 
     get<TestplayApi.Queue> { req ->
-        optionalAuthorization(OauthScope.TESTPLAY) { _, sess ->
-            call.respond(getTestplayQueue(sess?.userId, req.includePlayed, req.page.or(0)))
+        testplayApiQueueGetSlots.withPermit {
+            optionalAuthorization(OauthScope.TESTPLAY) { _, sess ->
+                call.respond(getTestplayQueue(sess?.userId, req.includePlayed, req.page.or(0)))
+            }
         }
     }
 
     get<TestplayApi.Recent> { req ->
-        requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
-            call.respond(getTestplayRecent(sess.userId, req.page.or(0)))
+        testplayApiRecentGetSlots.withPermit {
+            requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
+                call.respond(getTestplayRecent(sess.userId, req.page.or(0)))
+            }
         }
     }
 
     post<TestplayApi.State> {
-        requireAuthorization { _, sess ->
-            val newState = call.receive<StateUpdate>().let {
-                if (it.state == EMapState.Published && it.scheduleAt != null) {
-                    it.copy(state = EMapState.Scheduled)
-                } else if (it.state == EMapState.Scheduled && it.scheduleAt == null) {
-                    it.copy(state = EMapState.Published)
-                } else {
-                    it
-                }
-            }
-
-            val valid = transaction {
-                modelPostgresOperation()
-                val user = UserDao.wrapRow(
-                    User.joinPatreon().selectAll().where { User.id eq sess.userId }.handlePatreon().first()
-                )
-
-                if (newState.state == EMapState.Published) {
-                    publishVersion(newState.mapId, newState.hash, newState.alert, call.rb()) {
-                        it and (Beatmap.uploader eq sess.userId)
+        testplayApiStatePostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val newState = call.receive<StateUpdate>().let {
+                    if (it.state == EMapState.Published && it.scheduleAt != null) {
+                        it.copy(state = EMapState.Scheduled)
+                    } else if (it.state == EMapState.Scheduled && it.scheduleAt == null) {
+                        it.copy(state = EMapState.Published)
+                    } else {
+                        it
                     }
-                } else {
-                    fun updateState() =
-                        Versions.join(Beatmap, JoinType.INNER, onColumn = Versions.mapId, otherColumn = Beatmap.id).update({
-                            (Versions.hash eq newState.hash) and (Versions.mapId eq newState.mapId).let { q ->
-                                if (sess.isAdmin()) {
-                                    q // If current user is admin don't check the user
-                                } else {
-                                    q and (Beatmap.uploader eq sess.userId)
+                }
+
+                val valid = transaction {
+                    modelPostgresOperation()
+                    val user = UserDao.wrapRow(
+                        User.joinPatreon().selectAll().where { User.id eq sess.userId }.handlePatreon().first()
+                    )
+
+                    if (newState.state == EMapState.Published) {
+                        publishVersion(newState.mapId, newState.hash, newState.alert, call.rb()) {
+                            it and (Beatmap.uploader eq sess.userId)
+                        }
+                    } else {
+                        fun updateState() =
+                            Versions.join(Beatmap, JoinType.INNER, onColumn = Versions.mapId, otherColumn = Beatmap.id).update({
+                                (Versions.hash eq newState.hash) and (Versions.mapId eq newState.mapId).let { q ->
+                                    if (sess.isAdmin()) {
+                                        q // If current user is admin don't check the user
+                                    } else {
+                                        q and (Beatmap.uploader eq sess.userId)
+                                    }
+                                }
+                            }) {
+                                it[Versions.state] = newState.state
+                                if (newState.state == EMapState.Testplay) {
+                                    it[Versions.testplayAt] = Instant.now()
+                                } else if (newState.state == EMapState.Scheduled) {
+                                    // Can't be null as newState is set to Published in that case above
+                                    it[Versions.scheduledAt] = newState.scheduleAt!!.toJavaInstant()
                                 }
                             }
-                        }) {
-                            it[Versions.state] = newState.state
-                            if (newState.state == EMapState.Testplay) {
-                                it[Versions.testplayAt] = Instant.now()
-                            } else if (newState.state == EMapState.Scheduled) {
-                                // Can't be null as newState is set to Published in that case above
-                                it[Versions.scheduledAt] = newState.scheduleAt!!.toJavaInstant()
-                            }
-                        }
 
-                    val currentWipCount = userWipCount(sess.userId)
-                    val maxWips = (user.patreon.toTier() ?: PatreonTier.None).maxWips
-                    newState.state != EMapState.Uploaded || sess.isAdmin() || currentWipCount < maxWips || throw UserApiException(PatreonTier.maxWipsMessage)
+                        val currentWipCount = userWipCount(sess.userId)
+                        val maxWips = (user.patreon.toTier() ?: PatreonTier.None).maxWips
+                        newState.state != EMapState.Uploaded || sess.isAdmin() || currentWipCount < maxWips || throw UserApiException(PatreonTier.maxWipsMessage)
 
-                    (updateState() > 0).also { rTemp ->
-                        val reason = newState.reason
-                        if (rTemp && sess.isAdmin() && reason?.isEmpty() == false) {
-                            ModLog.insert(
-                                sess.userId,
-                                newState.mapId,
-                                UnpublishData(reason),
-                                wrapAsExpressionNotNull(
-                                    Beatmap.select(Beatmap.uploader).where { Beatmap.id eq newState.mapId }.limit(1)
+                        (updateState() > 0).also { rTemp ->
+                            val reason = newState.reason
+                            if (rTemp && sess.isAdmin() && reason?.isEmpty() == false) {
+                                ModLog.insert(
+                                    sess.userId,
+                                    newState.mapId,
+                                    UnpublishData(reason),
+                                    wrapAsExpressionNotNull(
+                                        Beatmap.select(Beatmap.uploader).where { Beatmap.id eq newState.mapId }.limit(1)
+                                    )
                                 )
-                            )
+                            }
                         }
                     }
                 }
+
+                valid || throw ServerApiException("Error updating map state")
+
+                modelRabbitMqOperation()
+
+                call.pub("beatmaps", "maps.${newState.mapId}.updated.state", null, newState.mapId)
+                call.respond(HttpStatusCode.OK, ActionResponse.success())
             }
-
-            valid || throw ServerApiException("Error updating map state")
-
-            modelRabbitMqOperation()
-
-            call.pub("beatmaps", "maps.${newState.mapId}.updated.state", null, newState.mapId)
-            call.respond(HttpStatusCode.OK, ActionResponse.success())
         }
     }
 
     post<TestplayApi.Version> {
-        requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
-            val update = call.receive<FeedbackUpdate>()
+        testplayApiVersionPostSlots.withPermit {
+            requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
+                val update = call.receive<FeedbackUpdate>()
 
-            val valid = transaction {
-                modelPostgresOperation()
-                Versions.join(Beatmap, JoinType.INNER, onColumn = Versions.mapId, otherColumn = Beatmap.id).update({
-                    (Versions.hash eq update.hash) and (Beatmap.uploader eq sess.userId)
-                }) {
-                    it[Versions.feedback] = update.feedback
-                } > 0
+                val valid = transaction {
+                    modelPostgresOperation()
+                    Versions.join(Beatmap, JoinType.INNER, onColumn = Versions.mapId, otherColumn = Beatmap.id).update({
+                        (Versions.hash eq update.hash) and (Beatmap.uploader eq sess.userId)
+                    }) {
+                        it[Versions.feedback] = update.feedback
+                    } > 0
+                }
+
+                call.respond(if (valid) HttpStatusCode.OK else HttpStatusCode.BadRequest)
             }
-
-            call.respond(if (valid) HttpStatusCode.OK else HttpStatusCode.BadRequest)
         }
     }
 
@@ -342,44 +359,46 @@ fun Route.testplayRoute(client: HttpClient) {
     }
 
     post<TestplayApi.Mark> {
-        requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
-            val mark = call.receive<MarkRequest>()
+        testplayApiMarkPostSlots.withPermit {
+            requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
+                val mark = call.receive<MarkRequest>()
 
-            transaction {
-                modelPostgresOperation()
-                val versionIdVal = if ((mark.removeFromQueue || mark.addToQueue) && sess.testplay) {
-                    val urResult = Versions.updateReturning(
-                        {
-                            Versions.hash eq mark.hash and (Versions.state neq EMapState.Published)
-                        },
-                        {
-                            it[state] = if (mark.removeFromQueue) EMapState.Feedback else EMapState.Testplay
-                        },
-                        Versions.id
-                    )
+                transaction {
+                    modelPostgresOperation()
+                    val versionIdVal = if ((mark.removeFromQueue || mark.addToQueue) && sess.testplay) {
+                        val urResult = Versions.updateReturning(
+                            {
+                                Versions.hash eq mark.hash and (Versions.state neq EMapState.Published)
+                            },
+                            {
+                                it[state] = if (mark.removeFromQueue) EMapState.Feedback else EMapState.Testplay
+                            },
+                            Versions.id
+                        )
 
-                    urResult?.firstOrNull()?.get(Versions.id)
-                } else {
-                    null
-                }
+                        urResult?.firstOrNull()?.get(Versions.id)
+                    } else {
+                        null
+                    }
 
-                if (mark.markPlayed) {
-                    Testplay.insertIgnore { t ->
-                        // If we updated the version already we know it's id, otherwise use a subquery
-                        if (versionIdVal != null) {
-                            t[versionId] = versionIdVal
-                        } else {
-                            t[versionId] = wrapAsExpressionNotNull<Int>(
-                                Versions.select(Versions.id).where {
-                                    Versions.hash eq mark.hash
-                                }.limit(1)
-                            )
+                    if (mark.markPlayed) {
+                        Testplay.insertIgnore { t ->
+                            // If we updated the version already we know it's id, otherwise use a subquery
+                            if (versionIdVal != null) {
+                                t[versionId] = versionIdVal
+                            } else {
+                                t[versionId] = wrapAsExpressionNotNull<Int>(
+                                    Versions.select(Versions.id).where {
+                                        Versions.hash eq mark.hash
+                                    }.limit(1)
+                                )
+                            }
+                            t[userId] = sess.userId
                         }
-                        t[userId] = sess.userId
                     }
                 }
+                call.respond(HttpStatusCode.OK)
             }
-            call.respond(HttpStatusCode.OK)
         }
     }
 

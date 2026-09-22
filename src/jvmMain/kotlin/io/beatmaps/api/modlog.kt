@@ -22,6 +22,7 @@ import io.beatmaps.common.dbo.joinUser
 import io.beatmaps.common.or
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.http.HttpStatusCode
@@ -29,6 +30,8 @@ import io.ktor.resources.Resource
 import io.ktor.server.resources.get
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.toKotlinInstant
 import kotlinx.serialization.UseSerializers
 import org.jetbrains.exposed.sql.JoinType
@@ -37,6 +40,8 @@ import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.lang.Integer.toHexString
+
+private val modLogApiModLogGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun ModLogOpType.actionLabel(action: IModLogOpAction) =
     when (action) {
@@ -67,50 +72,52 @@ class ModLogApi {
 
 fun Route.modLogRoute() {
     get<ModLogApi.ModLog> {
-        requireAuthorization { _, user ->
-            if (!user.isAdmin()) {
-                call.respond(HttpStatusCode.BadRequest)
-            } else {
-                val entries = transaction {
-                    modelPostgresOperation()
-                    ModLog
-                        .join(curatorAlias, JoinType.LEFT, ModLog.opBy, curatorAlias[User.id])
-                        .joinUser(ModLog.targetUser)
-                        .join(Beatmap, JoinType.LEFT, ModLog.opOn, Beatmap.id)
-                        .selectAll()
-                        .where {
-                            Op.TRUE
-                                .notNull(it.mod) { m -> curatorAlias[User.uniqueName] eq m }
-                                .notNull(it.user) { u -> User.uniqueName eq u }
-                                .notNull(it.type) { t -> ModLogOpType.fromName(t)?.let { ModLog.type eq it.ordinal } ?: Op.FALSE }
-                        }
-                        .orderBy(ModLog.opAt, SortOrder.DESC)
-                        .limit(it.page.or(0), 30)
-                        .map { row ->
-                            // Cache joins
-                            UserDao.wrapRow(row)
-                            UserDao.wrapRow(row, curatorAlias)
-                            if (row[ModLog.opOn] != null) BeatmapDao.wrapRow(row)
-
-                            ModLogDao.wrapRow(row).let { entry ->
-                                val type = entry.realType()
-                                val action = entry.realAction()
-                                ModLogEntry(
-                                    UserDetail.from(entry.opBy),
-                                    UserDetail.from(entry.targetUser),
-                                    entry.opOn?.let { dao ->
-                                        ModLogMapDetail(toHexString(dao.id.value), dao.name)
-                                    },
-                                    type,
-                                    entry.opAt.toKotlinInstant(),
-                                    action,
-                                    type.actionLabel(action)
-                                )
+        modLogApiModLogGetSlots.withPermit {
+            requireAuthorization { _, user ->
+                if (!user.isAdmin()) {
+                    call.respond(HttpStatusCode.BadRequest)
+                } else {
+                    val entries = transaction {
+                        modelPostgresOperation()
+                        ModLog
+                            .join(curatorAlias, JoinType.LEFT, ModLog.opBy, curatorAlias[User.id])
+                            .joinUser(ModLog.targetUser)
+                            .join(Beatmap, JoinType.LEFT, ModLog.opOn, Beatmap.id)
+                            .selectAll()
+                            .where {
+                                Op.TRUE
+                                    .notNull(it.mod) { m -> curatorAlias[User.uniqueName] eq m }
+                                    .notNull(it.user) { u -> User.uniqueName eq u }
+                                    .notNull(it.type) { t -> ModLogOpType.fromName(t)?.let { ModLog.type eq it.ordinal } ?: Op.FALSE }
                             }
-                        }
-                }
+                            .orderBy(ModLog.opAt, SortOrder.DESC)
+                            .limit(it.page.or(0), 30)
+                            .map { row ->
+                                // Cache joins
+                                UserDao.wrapRow(row)
+                                UserDao.wrapRow(row, curatorAlias)
+                                if (row[ModLog.opOn] != null) BeatmapDao.wrapRow(row)
 
-                call.respond(entries)
+                                ModLogDao.wrapRow(row).let { entry ->
+                                    val type = entry.realType()
+                                    val action = entry.realAction()
+                                    ModLogEntry(
+                                        UserDetail.from(entry.opBy),
+                                        UserDetail.from(entry.targetUser),
+                                        entry.opOn?.let { dao ->
+                                            ModLogMapDetail(toHexString(dao.id.value), dao.name)
+                                        },
+                                        type,
+                                        entry.opAt.toKotlinInstant(),
+                                        action,
+                                        type.actionLabel(action)
+                                    )
+                                }
+                            }
+                    }
+
+                    call.respond(entries)
+                }
             }
         }
     }

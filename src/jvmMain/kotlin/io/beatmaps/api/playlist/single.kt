@@ -56,6 +56,7 @@ import io.beatmaps.common.solr.getIds
 import io.beatmaps.common.util.cleanString
 import io.beatmaps.controllers.CdnSig
 import io.beatmaps.login.Session
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelSolrOperation
@@ -69,6 +70,8 @@ import io.ktor.server.response.respondRedirect
 import io.ktor.server.routing.Route
 import io.ktor.server.sessions.get
 import io.ktor.server.sessions.sessions
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Clock
 import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.alias
@@ -80,6 +83,11 @@ import java.io.File
 import java.util.Base64
 import kotlin.time.Duration.Companion.seconds
 import io.beatmaps.common.dbo.Playlist as PlaylistTable
+
+private val playlistApiDetailGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val playlistApiDetailWithPageGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val playlistApiDownloadGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val playlistApiOneClickSignGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Route.playlistSingle() {
     suspend fun performSearchForPlaylist(playlistId: Int, userId: Int?, config: SearchPlaylistConfig, cdnPrefix: String, page: Long, pageSize: Int, call: ApplicationCall): List<MapDetailWithOrder> {
@@ -247,125 +255,133 @@ fun Route.playlistSingle() {
     }
 
     getWithOptions<PlaylistApi.Detail> { req ->
-        optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
-            getDetail(req.id.or(0), cdnPrefix(), sess?.userId, sess?.isAdmin() == true, null, call)?.let { call.respond(it) } ?: call.respond(HttpStatusCode.NotFound)
+        playlistApiDetailGetSlots.withPermit {
+            optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
+                getDetail(req.id.or(0), cdnPrefix(), sess?.userId, sess?.isAdmin() == true, null, call)?.let { call.respond(it) } ?: call.respond(HttpStatusCode.NotFound)
+            }
         }
     }
 
     getWithOptions<PlaylistApi.DetailWithPage>("Get playlist detail".responds(ok<PlaylistPage>(), notFound())) { req ->
-        optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
-            getDetail(req.id.or(0), cdnPrefix(), sess?.userId, sess?.isAdmin() == true, req.page.or(0), call)?.let { call.respond(it) } ?: call.respond(HttpStatusCode.NotFound)
+        playlistApiDetailWithPageGetSlots.withPermit {
+            optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
+                getDetail(req.id.or(0), cdnPrefix(), sess?.userId, sess?.isAdmin() == true, req.page.or(0), call)?.let { call.respond(it) } ?: call.respond(HttpStatusCode.NotFound)
+            }
         }
     }
 
     val bookmarksIcon = javaClass.classLoader.getResourceAsStream("assets/favicon/android-chrome-512x512.png")!!.readAllBytes()
     get<PlaylistApi.Download> { req ->
-        val signed = CdnSig.verify("playlist-${req.id}", call.request)
+        playlistApiDownloadGetSlots.withPermit {
+            val signed = CdnSig.verify("playlist-${req.id}", call.request)
 
-        val (playlist, playlistSongs) = newSuspendedTransaction {
-            modelPostgresOperation()
-            fun getPlaylist() =
-                PlaylistTable
-                    .joinPlaylistCurator()
-                    .joinUser(PlaylistTable.owner)
-                    .selectAll()
-                    .where {
-                        (PlaylistTable.id eq req.id?.orNull()) and PlaylistTable.deletedAt.isNull()
-                    }
-                    .handleUser()
-                    .handleCurator()
-                    .firstOrNull()?.let {
-                        PlaylistFull.from(it, cdnPrefix())
-                    }
-
-            fun getMapsInPlaylist() =
-                PlaylistMap
-                    .join(Beatmap, JoinType.INNER, PlaylistMap.mapId, Beatmap.id)
-                    .joinVersions()
-                    .selectAll()
-                    .where {
-                        (PlaylistMap.playlistId eq req.id?.orNull()) and (Beatmap.deletedAt.isNull())
-                    }
-                    .orderBy(PlaylistMap.order)
-                    .complexToBeatmap()
-                    .mapNotNull { map ->
-                        map.versions.values.firstOrNull { v -> v.state == EMapState.Published }?.let { v ->
-                            PlaylistSong(
-                                Integer.toHexString(map.id.value),
-                                v.hash,
-                                map.name
-                            )
+            val (playlist, playlistSongs) = newSuspendedTransaction {
+                modelPostgresOperation()
+                fun getPlaylist() =
+                    PlaylistTable
+                        .joinPlaylistCurator()
+                        .joinUser(PlaylistTable.owner)
+                        .selectAll()
+                        .where {
+                            (PlaylistTable.id eq req.id?.orNull()) and PlaylistTable.deletedAt.isNull()
                         }
-                    }
-
-            val playlist = getPlaylist()
-            val config = playlist?.config
-
-            if (playlist?.type == EPlaylistType.Search && config is SearchPlaylistConfig) {
-                playlist to performSearchForPlaylist(playlist.playlistId, null, config, cdnPrefix(), 0, PlaylistConstants.MAX_SEARCH_MAPS, call)
-                    .mapNotNull {
-                        it.map.publishedVersion()?.let { v ->
-                            PlaylistSong(
-                                it.map.id,
-                                v.hash,
-                                it.map.name
-                            )
+                        .handleUser()
+                        .handleCurator()
+                        .firstOrNull()?.let {
+                            PlaylistFull.from(it, cdnPrefix())
                         }
-                    }
-            } else {
-                playlist to getMapsInPlaylist()
-            }
-        }
 
-        optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
-            if (playlist != null && (signed || playlist.type.anonymousAllowed || playlist.owner.id == sess?.userId)) {
-                val localFile = when (playlist.type) {
-                    EPlaylistType.System -> bookmarksIcon
-                    else -> File(Folders.localPlaylistCoverFolder(), "${playlist.playlistId}.jpg").readBytes()
+                fun getMapsInPlaylist() =
+                    PlaylistMap
+                        .join(Beatmap, JoinType.INNER, PlaylistMap.mapId, Beatmap.id)
+                        .joinVersions()
+                        .selectAll()
+                        .where {
+                            (PlaylistMap.playlistId eq req.id?.orNull()) and (Beatmap.deletedAt.isNull())
+                        }
+                        .orderBy(PlaylistMap.order)
+                        .complexToBeatmap()
+                        .mapNotNull { map ->
+                            map.versions.values.firstOrNull { v -> v.state == EMapState.Published }?.let { v ->
+                                PlaylistSong(
+                                    Integer.toHexString(map.id.value),
+                                    v.hash,
+                                    map.name
+                                )
+                            }
+                        }
+
+                val playlist = getPlaylist()
+                val config = playlist?.config
+
+                if (playlist?.type == EPlaylistType.Search && config is SearchPlaylistConfig) {
+                    playlist to performSearchForPlaylist(playlist.playlistId, null, config, cdnPrefix(), 0, PlaylistConstants.MAX_SEARCH_MAPS, call)
+                        .mapNotNull {
+                            it.map.publishedVersion()?.let { v ->
+                                PlaylistSong(
+                                    it.map.id,
+                                    v.hash,
+                                    it.map.name
+                                )
+                            }
+                        }
+                } else {
+                    playlist to getMapsInPlaylist()
                 }
-                val imageStr = Base64.getEncoder().encodeToString(localFile)
+            }
 
-                val cleanName = cleanString("BeatSaver - ${playlist.name}.bplist")
-                call.response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"${cleanName}\"")
-                call.respond(
-                    Playlist(
-                        playlist.name,
-                        playlist.owner.name,
-                        playlist.description,
-                        imageStr,
-                        PlaylistCustomData(playlist.downloadURL),
-                        playlistSongs
+            optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
+                if (playlist != null && (signed || playlist.type.anonymousAllowed || playlist.owner.id == sess?.userId)) {
+                    val localFile = when (playlist.type) {
+                        EPlaylistType.System -> bookmarksIcon
+                        else -> File(Folders.localPlaylistCoverFolder(), "${playlist.playlistId}.jpg").readBytes()
+                    }
+                    val imageStr = Base64.getEncoder().encodeToString(localFile)
+
+                    val cleanName = cleanString("BeatSaver - ${playlist.name}.bplist")
+                    call.response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"${cleanName}\"")
+                    call.respond(
+                        Playlist(
+                            playlist.name,
+                            playlist.owner.name,
+                            playlist.description,
+                            imageStr,
+                            PlaylistCustomData(playlist.downloadURL),
+                            playlistSongs
+                        )
                     )
-                )
-            } else {
-                call.respond(HttpStatusCode.NotFound)
+                } else {
+                    call.respond(HttpStatusCode.NotFound)
+                }
             }
         }
     }
 
     get<PlaylistApi.OneClickSign> { req ->
-        val sess = call.sessions.get<Session>()
+        playlistApiOneClickSignGetSlots.withPermit {
+            val sess = call.sessions.get<Session>()
 
-        transaction {
-            modelPostgresOperation()
-            PlaylistTable
-                .selectAll()
-                .where {
-                    (PlaylistTable.id eq req.id?.orNull()) and PlaylistTable.deletedAt.isNull()
+            transaction {
+                modelPostgresOperation()
+                PlaylistTable
+                    .selectAll()
+                    .where {
+                        (PlaylistTable.id eq req.id?.orNull()) and PlaylistTable.deletedAt.isNull()
+                    }
+                    .firstOrNull()
+                    ?.let { PlaylistDao.wrapRow(it) }
+            }?.let { playlist ->
+                val sig = if (!playlist.type.anonymousAllowed && playlist.ownerId.value == sess?.userId) {
+                    val exp = Clock.System.now().plus(60.seconds).epochSeconds
+                    "?" + CdnSig.queryParams("playlist-${req.id}", exp)
+                } else {
+                    ""
                 }
-                .firstOrNull()
-                ?.let { PlaylistDao.wrapRow(it) }
-        }?.let { playlist ->
-            val sig = if (!playlist.type.anonymousAllowed && playlist.ownerId.value == sess?.userId) {
-                val exp = Clock.System.now().plus(60.seconds).epochSeconds
-                "?" + CdnSig.queryParams("playlist-${req.id}", exp)
-            } else {
-                ""
+
+                val url = "bsplaylist://playlist/${Config.apiBase(true)}/playlists/id/${playlist.id.value}/download$sig"
+
+                call.respondRedirect(url)
             }
-
-            val url = "bsplaylist://playlist/${Config.apiBase(true)}/playlists/id/${playlist.id.value}/download$sig"
-
-            call.respondRedirect(url)
         }
     }
 }

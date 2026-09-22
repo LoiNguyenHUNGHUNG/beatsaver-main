@@ -55,6 +55,9 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
 
+private val playlistApiCreatePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val playlistApiEditPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 interface IPlaylistUpdate {
     val name: String?
     val description: String?
@@ -90,38 +93,124 @@ private val playlistEditSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Route.playlistCreate(client: HttpClient) {
     post<PlaylistApi.Create> {
-        requireAuthorization(OauthScope.ADMIN_PLAYLISTS) { authType, sess ->
-            val files = mutableMapOf<Int, File>()
+        playlistApiCreatePostSlots.withPermit {
+            requireAuthorization(OauthScope.ADMIN_PLAYLISTS) { authType, sess ->
+                val files = mutableMapOf<Int, File>()
 
-            try {
-                val multipart = playlistCreateSlots.withPermit {
+                try {
+                    val multipart = playlistCreateSlots.withPermit {
+                        handleMultipart(client) { part ->
+                            val its = part.provider()
+                            val tmp = ByteArrayOutputStream()
+                            its.copyToSuspend(tmp, sizeLimit = FileLimits.PLAYLIST_IMAGE_LIMIT)
+
+                            thumbnailSizes.forEach { s ->
+                                files[s] = File(Folders.uploadTempFolder(), "upload-${System.currentTimeMillis()}-${sess.userId.hashCode()}-$s.jpg").also { localFile ->
+                                    Thumbnails
+                                        .of(tmp.toByteArray().inputStream())
+                                        .size(s, s)
+                                        .imageType(BufferedImage.TYPE_INT_RGB)
+                                        .outputFormat("JPEG")
+                                        .outputQuality(0.8)
+                                        .toFile(localFile)
+                                }
+                            }
+                        }
+                    }
+
+                    multipart.validRecaptcha(authType) || throw UploadException("Missing recaptcha?")
+                    val data = multipart.get<PlaylistCreateMultipart>()
+
+                    val toCreate = newSuspendedTransaction {
+                        modelPostgresOperation()
+                        PlaylistBasic(
+                            0,
+                            "",
+                            data.name ?: "",
+                            typeFromReq(data, sess),
+                            sess.userId,
+                            data.config
+                        )
+                    }
+
+                    validate(toCreate) {
+                        validate(PlaylistBasic::name).isNotBlank().hasSize(3, PlaylistConstants.MAX_NAME_LENGTH)
+                        validate(PlaylistBasic::playlistImage).validate(NotBlank) {
+                            files.isNotEmpty()
+                        }
+                    }
+
+                    val newId = transaction {
+                        modelPostgresOperation()
+                        Playlist.insertAndGetId {
+                            it[name] = toCreate.name
+                            it[description] = data.description?.take(PlaylistConstants.MAX_DESCRIPTION_LENGTH) ?: ""
+                            it[owner] = toCreate.owner
+                            it[type] = toCreate.type
+                            it[config] = toCreate.config
+                        }.value
+                    }
+
+                    files.forEach { (s, temp) ->
+                        val localFile = File(Folders.localPlaylistCoverFolder(s), "$newId.jpg")
+                        Files.move(temp.toPath(), localFile.toPath())
+                    }
+
+                    modelRabbitMqOperation()
+
+                    call.pub("beatmaps", "playlists.$newId.created", null, newId)
+                    call.respond(UploadResponse(newId.toString()))
+                } finally {
+                    files.values.forEach { temp ->
+                        temp.delete()
+                    }
+                }
+            }
+        }
+    }
+
+    post<PlaylistApi.Edit> { req ->
+        playlistApiEditPostSlots.withPermit {
+            requireAuthorization(OauthScope.ADMIN_PLAYLISTS) { _, sess ->
+                val query = (Playlist.id eq req.id?.orNull() and Playlist.deletedAt.isNull()).let { q ->
+                    if (sess.isAdmin()) {
+                        q
+                    } else {
+                        q.and(Playlist.owner eq sess.userId)
+                    } and (Playlist.type neq EPlaylistType.System)
+                }
+
+                val beforePlaylist = newSuspendedTransaction {
+                    modelPostgresOperation()
+                    Playlist.selectAll().where(query).firstOrNull()?.let { PlaylistFull.from(it, cdnPrefix()) }
+                } ?: throw UploadException("Playlist not found")
+
+                val multipart = playlistEditSlots.withPermit {
                     handleMultipart(client) { part ->
                         val its = part.provider()
                         val tmp = ByteArrayOutputStream()
                         its.copyToSuspend(tmp, sizeLimit = FileLimits.PLAYLIST_IMAGE_LIMIT)
 
                         thumbnailSizes.forEach { s ->
-                            files[s] = File(Folders.uploadTempFolder(), "upload-${System.currentTimeMillis()}-${sess.userId.hashCode()}-$s.jpg").also { localFile ->
-                                Thumbnails
-                                    .of(tmp.toByteArray().inputStream())
-                                    .size(s, s)
-                                    .imageType(BufferedImage.TYPE_INT_RGB)
-                                    .outputFormat("JPEG")
-                                    .outputQuality(0.8)
-                                    .toFile(localFile)
-                            }
+                            val localFile = File(Folders.localPlaylistCoverFolder(s), "${req.id?.orNull()}.jpg")
+
+                            Thumbnails
+                                .of(tmp.toByteArray().inputStream())
+                                .size(s, s)
+                                .imageType(BufferedImage.TYPE_INT_RGB)
+                                .outputFormat("JPEG")
+                                .outputQuality(0.8)
+                                .toFile(localFile)
                         }
                     }
                 }
+                val data = multipart.get<PlaylistEditMultipart>()
 
-                multipart.validRecaptcha(authType) || throw UploadException("Missing recaptcha?")
-                val data = multipart.get<PlaylistCreateMultipart>()
-
+                val newDescription = data.description?.take(PlaylistConstants.MAX_DESCRIPTION_LENGTH) ?: ""
                 val toCreate = newSuspendedTransaction {
                     modelPostgresOperation()
                     PlaylistBasic(
-                        0,
-                        "",
+                        0, "",
                         data.name ?: "",
                         typeFromReq(data, sess),
                         sess.userId,
@@ -129,137 +218,55 @@ fun Route.playlistCreate(client: HttpClient) {
                     )
                 }
 
-                validate(toCreate) {
-                    validate(PlaylistBasic::name).isNotBlank().hasSize(3, PlaylistConstants.MAX_NAME_LENGTH)
-                    validate(PlaylistBasic::playlistImage).validate(NotBlank) {
-                        files.isNotEmpty()
+                if (data.deleted != true) {
+                    validate(toCreate) {
+                        validate(PlaylistBasic::name).isNotBlank().hasSize(3, PlaylistConstants.MAX_NAME_LENGTH)
                     }
                 }
 
-                val newId = transaction {
+                transaction {
                     modelPostgresOperation()
-                    Playlist.insertAndGetId {
-                        it[name] = toCreate.name
-                        it[description] = data.description?.take(PlaylistConstants.MAX_DESCRIPTION_LENGTH) ?: ""
-                        it[owner] = toCreate.owner
-                        it[type] = toCreate.type
-                        it[config] = toCreate.config
-                    }.value
-                }
+                    fun updatePlaylist() {
+                        Playlist.update({
+                            query
+                        }) {
+                            if (data.deleted == true) {
+                                it[deletedAt] = NowExpression(deletedAt)
+                            } else {
+                                it[name] = toCreate.name
+                                it[description] = newDescription
+                                it[type] = toCreate.type
+                                it[config] = toCreate.config
+                            }
+                            it[updatedAt] = NowExpression(updatedAt)
+                        } > 0 || throw UploadException("Update failed")
+                    }
 
-                files.forEach { (s, temp) ->
-                    val localFile = File(Folders.localPlaylistCoverFolder(s), "$newId.jpg")
-                    Files.move(temp.toPath(), localFile.toPath())
+                    updatePlaylist().also {
+                        if (sess.isAdmin() && beforePlaylist.owner.id != sess.userId) {
+                            ModLog.insert(
+                                sess.userId,
+                                null,
+                                if (data.deleted == true) {
+                                    DeletedPlaylistData(req.id.or(0), data.reason ?: "")
+                                } else {
+                                    EditPlaylistData(
+                                        req.id.or(0),
+                                        beforePlaylist.name, beforePlaylist.description, beforePlaylist.type == EPlaylistType.Public,
+                                        toCreate.name, newDescription, toCreate.type == EPlaylistType.Public
+                                    )
+                                },
+                                beforePlaylist.owner.id
+                            )
+                        }
+                    }
                 }
 
                 modelRabbitMqOperation()
 
-                call.pub("beatmaps", "playlists.$newId.created", null, newId)
-                call.respond(UploadResponse(newId.toString()))
-            } finally {
-                files.values.forEach { temp ->
-                    temp.delete()
-                }
+                call.pub("beatmaps", "playlists.${req.id}.updated.detail", null, req.id.or(0))
+                call.respond(UploadResponse(req.id.toString()))
             }
-        }
-    }
-
-    post<PlaylistApi.Edit> { req ->
-        requireAuthorization(OauthScope.ADMIN_PLAYLISTS) { _, sess ->
-            val query = (Playlist.id eq req.id?.orNull() and Playlist.deletedAt.isNull()).let { q ->
-                if (sess.isAdmin()) {
-                    q
-                } else {
-                    q.and(Playlist.owner eq sess.userId)
-                } and (Playlist.type neq EPlaylistType.System)
-            }
-
-            val beforePlaylist = newSuspendedTransaction {
-                modelPostgresOperation()
-                Playlist.selectAll().where(query).firstOrNull()?.let { PlaylistFull.from(it, cdnPrefix()) }
-            } ?: throw UploadException("Playlist not found")
-
-            val multipart = playlistEditSlots.withPermit {
-                handleMultipart(client) { part ->
-                    val its = part.provider()
-                    val tmp = ByteArrayOutputStream()
-                    its.copyToSuspend(tmp, sizeLimit = FileLimits.PLAYLIST_IMAGE_LIMIT)
-
-                    thumbnailSizes.forEach { s ->
-                        val localFile = File(Folders.localPlaylistCoverFolder(s), "${req.id?.orNull()}.jpg")
-
-                        Thumbnails
-                            .of(tmp.toByteArray().inputStream())
-                            .size(s, s)
-                            .imageType(BufferedImage.TYPE_INT_RGB)
-                            .outputFormat("JPEG")
-                            .outputQuality(0.8)
-                            .toFile(localFile)
-                    }
-                }
-            }
-            val data = multipart.get<PlaylistEditMultipart>()
-
-            val newDescription = data.description?.take(PlaylistConstants.MAX_DESCRIPTION_LENGTH) ?: ""
-            val toCreate = newSuspendedTransaction {
-                modelPostgresOperation()
-                PlaylistBasic(
-                    0, "",
-                    data.name ?: "",
-                    typeFromReq(data, sess),
-                    sess.userId,
-                    data.config
-                )
-            }
-
-            if (data.deleted != true) {
-                validate(toCreate) {
-                    validate(PlaylistBasic::name).isNotBlank().hasSize(3, PlaylistConstants.MAX_NAME_LENGTH)
-                }
-            }
-
-            transaction {
-                modelPostgresOperation()
-                fun updatePlaylist() {
-                    Playlist.update({
-                        query
-                    }) {
-                        if (data.deleted == true) {
-                            it[deletedAt] = NowExpression(deletedAt)
-                        } else {
-                            it[name] = toCreate.name
-                            it[description] = newDescription
-                            it[type] = toCreate.type
-                            it[config] = toCreate.config
-                        }
-                        it[updatedAt] = NowExpression(updatedAt)
-                    } > 0 || throw UploadException("Update failed")
-                }
-
-                updatePlaylist().also {
-                    if (sess.isAdmin() && beforePlaylist.owner.id != sess.userId) {
-                        ModLog.insert(
-                            sess.userId,
-                            null,
-                            if (data.deleted == true) {
-                                DeletedPlaylistData(req.id.or(0), data.reason ?: "")
-                            } else {
-                                EditPlaylistData(
-                                    req.id.or(0),
-                                    beforePlaylist.name, beforePlaylist.description, beforePlaylist.type == EPlaylistType.Public,
-                                    toCreate.name, newDescription, toCreate.type == EPlaylistType.Public
-                                )
-                            },
-                            beforePlaylist.owner.id
-                        )
-                    }
-                }
-            }
-
-            modelRabbitMqOperation()
-
-            call.pub("beatmaps", "playlists.${req.id}.updated.detail", null, req.id.or(0))
-            call.respond(UploadResponse(req.id.toString()))
         }
     }
 }

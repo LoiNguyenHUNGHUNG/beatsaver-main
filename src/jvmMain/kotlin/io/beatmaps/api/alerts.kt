@@ -20,6 +20,7 @@ import io.beatmaps.common.or
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.login.Session
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.requireAuthorization
@@ -32,6 +33,8 @@ import io.ktor.server.resources.post
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.RoutingContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.toKotlinInstant
 import kotlinx.serialization.UseSerializers
 import org.jetbrains.exposed.sql.JoinType
@@ -48,6 +51,13 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.unionAll
 import org.jetbrains.exposed.sql.update
 import java.lang.Integer.toHexString
+
+private val alertsApiUnreadGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val alertsApiReadGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val alertsApiStatsGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val alertsApiOptionsPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val alertsApiMarkPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val alertsApiMarkAllPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 @Resource("/api/alerts")
 class AlertsApi {
@@ -189,18 +199,22 @@ fun Route.alertsRoute() {
     }
 
     get<AlertsApi.Unread> {
-        requireAuthorization(OauthScope.ALERTS) { _, user ->
-            val alerts = getAlerts(user.userId, false, it.page.or(0), EAlertType.fromList(it.type))
+        alertsApiUnreadGetSlots.withPermit {
+            requireAuthorization(OauthScope.ALERTS) { _, user ->
+                val alerts = getAlerts(user.userId, false, it.page.or(0), EAlertType.fromList(it.type))
 
-            call.respond(alerts)
+                call.respond(alerts)
+            }
         }
     }
 
     get<AlertsApi.Read> {
-        requireAuthorization(OauthScope.ALERTS) { _, user ->
-            val alerts = getAlerts(user.userId, true, it.page.or(0), EAlertType.fromList(it.type))
+        alertsApiReadGetSlots.withPermit {
+            requireAuthorization(OauthScope.ALERTS) { _, user ->
+                val alerts = getAlerts(user.userId, true, it.page.or(0), EAlertType.fromList(it.type))
 
-            call.respond(alerts)
+                call.respond(alerts)
+            }
         }
     }
 
@@ -237,33 +251,37 @@ fun Route.alertsRoute() {
             }
 
     get<AlertsApi.Stats> {
-        requireAuthorization(OauthScope.ALERTS) { _, sess ->
-            val (statParts, user) = transaction {
-                modelPostgresOperation()
-                getStats(sess.userId) to UserDao[sess.userId]
-            }
+        alertsApiStatsGetSlots.withPermit {
+            requireAuthorization(OauthScope.ALERTS) { _, sess ->
+                val (statParts, user) = transaction {
+                    modelPostgresOperation()
+                    getStats(sess.userId) to UserDao[sess.userId]
+                }
 
-            call.respond(UserAlertStats.fromParts(statParts).copy(reviewAlerts = user.reviewAlerts, curationAlerts = user.curationAlerts, followAlerts = user.followAlerts))
+                call.respond(UserAlertStats.fromParts(statParts).copy(reviewAlerts = user.reviewAlerts, curationAlerts = user.curationAlerts, followAlerts = user.followAlerts))
+            }
         }
     }
 
     post<AlertsApi.Options> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<AlertOptionsRequest>()
+        alertsApiOptionsPostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<AlertOptionsRequest>()
 
-            transaction {
-                modelPostgresOperation()
-                User.update({
-                    User.id eq sess.userId
-                }) {
-                    it[reviewAlerts] = req.reviewAlerts
-                    it[curationAlerts] = req.curationAlerts
-                    it[followAlerts] = req.followAlerts
-                    it[updatedAt] = NowExpression(updatedAt)
+                transaction {
+                    modelPostgresOperation()
+                    User.update({
+                        User.id eq sess.userId
+                    }) {
+                        it[reviewAlerts] = req.reviewAlerts
+                        it[curationAlerts] = req.curationAlerts
+                        it[followAlerts] = req.followAlerts
+                        it[updatedAt] = NowExpression(updatedAt)
+                    }
                 }
-            }
 
-            call.respond(ActionResponse.success())
+                call.respond(ActionResponse.success())
+            }
         }
     }
 
@@ -281,59 +299,63 @@ fun Route.alertsRoute() {
         }
 
     post<AlertsApi.Mark> {
-        val req = call.receive<AlertUpdate>()
+        alertsApiMarkPostSlots.withPermit {
+            val req = call.receive<AlertUpdate>()
 
-        requireAuthorization(OauthScope.MARK_ALERTS) { _, user ->
-            val stats = transaction {
-                modelPostgresOperation()
-                val result = AlertRecipient
-                    .join(Alert, JoinType.INNER, AlertRecipient.alertId, Alert.id)
-                    .update({
-                        (Alert.id eq req.id) and
-                            AlertRecipient.readAt.run { if (req.read) isNull() else isNotNull() } and
-                            (AlertRecipient.recipientId eq user.userId)
-                    }) {
-                        if (req.read) {
-                            it[AlertRecipient.readAt] = NowExpression(AlertRecipient.readAt)
-                        } else {
-                            it[AlertRecipient.readAt] = null
+            requireAuthorization(OauthScope.MARK_ALERTS) { _, user ->
+                val stats = transaction {
+                    modelPostgresOperation()
+                    val result = AlertRecipient
+                        .join(Alert, JoinType.INNER, AlertRecipient.alertId, Alert.id)
+                        .update({
+                            (Alert.id eq req.id) and
+                                AlertRecipient.readAt.run { if (req.read) isNull() else isNotNull() } and
+                                (AlertRecipient.recipientId eq user.userId)
+                        }) {
+                            if (req.read) {
+                                it[AlertRecipient.readAt] = NowExpression(AlertRecipient.readAt)
+                            } else {
+                                it[AlertRecipient.readAt] = null
+                            }
                         }
-                    }
 
-                if (result > 0) {
-                    getStats(user.userId)
-                } else { null }
+                    if (result > 0) {
+                        getStats(user.userId)
+                    } else { null }
+                }
+
+                respondStats(user, stats)
             }
-
-            respondStats(user, stats)
         }
     }
 
     post<AlertsApi.MarkAll> {
-        val req = call.receive<AlertUpdateAll>()
+        alertsApiMarkAllPostSlots.withPermit {
+            val req = call.receive<AlertUpdateAll>()
 
-        requireAuthorization(OauthScope.MARK_ALERTS) { _, user ->
-            val stats = transaction {
-                modelPostgresOperation()
-                val result = AlertRecipient.update({
-                    AlertRecipient.readAt.run { if (req.read) isNull() else isNotNull() } and
-                        (AlertRecipient.recipientId eq user.userId)
-                }) {
-                    if (req.read) {
-                        it[readAt] = NowExpression(readAt)
+            requireAuthorization(OauthScope.MARK_ALERTS) { _, user ->
+                val stats = transaction {
+                    modelPostgresOperation()
+                    val result = AlertRecipient.update({
+                        AlertRecipient.readAt.run { if (req.read) isNull() else isNotNull() } and
+                            (AlertRecipient.recipientId eq user.userId)
+                    }) {
+                        if (req.read) {
+                            it[readAt] = NowExpression(readAt)
+                        } else {
+                            it[readAt] = null
+                        }
+                    }
+
+                    if (result > 0) {
+                        getStats(user.userId)
                     } else {
-                        it[readAt] = null
+                        null
                     }
                 }
 
-                if (result > 0) {
-                    getStats(user.userId)
-                } else {
-                    null
-                }
+                respondStats(user, stats)
             }
-
-            respondStats(user, stats)
         }
     }
 }
