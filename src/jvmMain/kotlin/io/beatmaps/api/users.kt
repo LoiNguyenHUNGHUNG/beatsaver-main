@@ -170,6 +170,31 @@ import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.DurationUnit
 
+private val usersApiUsernamePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiDescriptionApiPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiBlurApiPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiAdminPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiSuspendPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiSilencePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiSessionsGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiSessionsDeleteSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiSessionsByIdDeleteSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiChangeEmailPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiResetPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiMePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiFollowPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiFindGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiListGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiUserPlaylistGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiMeGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiUserIdGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiUserIdsGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mapsApiUserNameGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiFollowingGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiFollowedByGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiSearchGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val usersApiCuratorsGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 private val publicAccountStandingDays = (System.getenv("PUBLIC_ACCOUNT_STANDING_DAYS")?.toIntOrNull() ?: 90)
 
 fun JwtBuilder.setExpiration(duration: Duration): JwtBuilder = setExpiration(Date.from(Clock.System.now().plus(duration).toJavaInstant()))
@@ -508,128 +533,136 @@ private suspend fun downloadPlaylistAvatar(client: HttpClient, url: String) =
 fun Route.userRoute(client: HttpClient) {
     val usernameRegex = Regex("^[._\\-A-Za-z0-9]{3,50}$")
     post<UsersApi.Username> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<AccountDetailReq>()
+        usersApiUsernamePostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<AccountDetailReq>()
 
-            if (!usernameRegex.matches(req.textContent)) {
-                throw UserApiException("Username not valid")
-            } else {
-                val success = transaction {
-                    modelPostgresOperation()
-                    try {
-                        User.update({ User.id eq sess.userId and (User.uniqueName.isNull() or User.renamedAt.lessEq(DateMinusDays(NowExpression(User.renamedAt), 1))) }) { u ->
-                            u[uniqueName] = req.textContent
-                            u[renamedAt] = Expression.build { case().When(uniqueName eq req.textContent, renamedAt).Else(NowExpression(renamedAt)) }
-                            u[updatedAt] = NowExpression(updatedAt)
-                        } > 0
-                    } catch (_: ExposedSQLException) {
-                        throw UserApiException("Username already taken")
+                if (!usernameRegex.matches(req.textContent)) {
+                    throw UserApiException("Username not valid")
+                } else {
+                    val success = transaction {
+                        modelPostgresOperation()
+                        try {
+                            User.update({ User.id eq sess.userId and (User.uniqueName.isNull() or User.renamedAt.lessEq(DateMinusDays(NowExpression(User.renamedAt), 1))) }) { u ->
+                                u[uniqueName] = req.textContent
+                                u[renamedAt] = Expression.build { case().When(uniqueName eq req.textContent, renamedAt).Else(NowExpression(renamedAt)) }
+                                u[updatedAt] = NowExpression(updatedAt)
+                            } > 0
+                        } catch (_: ExposedSQLException) {
+                            throw UserApiException("Username already taken")
+                        }
                     }
+
+                    success || throw UserApiException("You can only set a new username once per day")
+
+                    call.sessions.set(sess.copy(uniqueName = req.textContent))
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "user.${sess.userId}.updated.name", null, sess.userId)
+                    call.respond(ActionResponse.success())
                 }
-
-                success || throw UserApiException("You can only set a new username once per day")
-
-                call.sessions.set(sess.copy(uniqueName = req.textContent))
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "user.${sess.userId}.updated.name", null, sess.userId)
-                call.respond(ActionResponse.success())
             }
         }
     }
 
     post<UsersApi.DescriptionApi> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<AccountDetailReq>()
+        usersApiDescriptionApiPostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<AccountDetailReq>()
 
-            val success = transaction {
-                modelPostgresOperation()
-                try {
-                    User.update({ User.id eq sess.userId }) { u ->
-                        u[description] = req.textContent.take(UserConstants.MAX_DESCRIPTION_LENGTH)
-                        u[updatedAt] = NowExpression(updatedAt)
-                    } > 0
-                } catch (_: ExposedSQLException) {
-                    false
+                val success = transaction {
+                    modelPostgresOperation()
+                    try {
+                        User.update({ User.id eq sess.userId }) { u ->
+                            u[description] = req.textContent.take(UserConstants.MAX_DESCRIPTION_LENGTH)
+                            u[updatedAt] = NowExpression(updatedAt)
+                        } > 0
+                    } catch (_: ExposedSQLException) {
+                        false
+                    }
                 }
-            }
 
-            success || throw ServerApiException("Something went wrong")
-            modelRabbitMqOperation()
-            call.pub("beatmaps", "user.${sess.userId}.updated.info", null, sess.userId)
-            call.respond(ActionResponse.success())
+                success || throw ServerApiException("Something went wrong")
+                modelRabbitMqOperation()
+                call.pub("beatmaps", "user.${sess.userId}.updated.info", null, sess.userId)
+                call.respond(ActionResponse.success())
+            }
         }
     }
 
     post<UsersApi.BlurApi> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<BlurReq>()
+        usersApiBlurApiPostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<BlurReq>()
 
-            transaction {
-                modelPostgresOperation()
-                try {
-                    User.update({ User.id eq sess.userId }) { u ->
-                        u[blurnsfw] = req.blur
-                        u[updatedAt] = NowExpression(updatedAt)
-                    } > 0
-                } catch (_: ExposedSQLException) {
-                    false
-                }
-            } || throw ServerApiException("Something went wrong")
+                transaction {
+                    modelPostgresOperation()
+                    try {
+                        User.update({ User.id eq sess.userId }) { u ->
+                            u[blurnsfw] = req.blur
+                            u[updatedAt] = NowExpression(updatedAt)
+                        } > 0
+                    } catch (_: ExposedSQLException) {
+                        false
+                    }
+                } || throw ServerApiException("Something went wrong")
 
-            MongoClient.updateSessions(sess.userId, Session::blurnsfw, req.blur)
-            call.respond(ActionResponse.success())
+                MongoClient.updateSessions(sess.userId, Session::blurnsfw, req.blur)
+                call.respond(ActionResponse.success())
+            }
         }
     }
 
     post<UsersApi.Admin> {
-        requireAuthorization { _, sess ->
-            if (!sess.isAdmin()) {
-                ActionResponse.error("Not an admin")
-            } else {
-                val req = call.receive<UserAdminRequest>()
-                if (UserAdminRequest.allowedUploadSizes.contains(req.maxUploadSize) && UserAdminRequest.allowedVivifySizes.contains(req.maxVivifySize)) {
-                    transaction {
-                        modelPostgresOperation()
-                        fun runUpdate() =
-                            User.update({
-                                User.id eq req.userId
-                            }) { u ->
-                                u[uploadLimit] = req.maxUploadSize
-                                u[vivifyLimit] = req.maxVivifySize
-                                u[curator] = req.curator
-                                u[seniorCurator] = req.curator && req.seniorCurator
-                                u[verifiedMapper] = req.verifiedMapper
-                                u[curatorTab] = req.curatorTab
-                                u[updatedAt] = NowExpression(updatedAt)
-                            } > 0
+        usersApiAdminPostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                if (!sess.isAdmin()) {
+                    ActionResponse.error("Not an admin")
+                } else {
+                    val req = call.receive<UserAdminRequest>()
+                    if (UserAdminRequest.allowedUploadSizes.contains(req.maxUploadSize) && UserAdminRequest.allowedVivifySizes.contains(req.maxVivifySize)) {
+                        transaction {
+                            modelPostgresOperation()
+                            fun runUpdate() =
+                                User.update({
+                                    User.id eq req.userId
+                                }) { u ->
+                                    u[uploadLimit] = req.maxUploadSize
+                                    u[vivifyLimit] = req.maxVivifySize
+                                    u[curator] = req.curator
+                                    u[seniorCurator] = req.curator && req.seniorCurator
+                                    u[verifiedMapper] = req.verifiedMapper
+                                    u[curatorTab] = req.curatorTab
+                                    u[updatedAt] = NowExpression(updatedAt)
+                                } > 0
 
-                        runUpdate().also {
-                            if (it) {
-                                ModLog.insert(
-                                    sess.userId,
-                                    null,
-                                    UploadLimitData(req.maxUploadSize, req.curator, req.verifiedMapper, req.curatorTab, req.maxVivifySize),
-                                    req.userId
-                                )
+                            runUpdate().also {
+                                if (it) {
+                                    ModLog.insert(
+                                        sess.userId,
+                                        null,
+                                        UploadLimitData(req.maxUploadSize, req.curator, req.verifiedMapper, req.curatorTab, req.maxVivifySize),
+                                        req.userId
+                                    )
+                                }
+                            }
+                        }.let { success ->
+                            if (success) {
+                                MongoClient.updateSessions(req.userId, Session::curator, req.curator)
+
+                                modelRabbitMqOperation()
+
+                                call.pub("beatmaps", "user.${req.userId}.updated.admin", null, req.userId)
+                                ActionResponse.success()
+                            } else {
+                                ActionResponse.error("User not found")
                             }
                         }
-                    }.let { success ->
-                        if (success) {
-                            MongoClient.updateSessions(req.userId, Session::curator, req.curator)
-
-                            modelRabbitMqOperation()
-
-                            call.pub("beatmaps", "user.${req.userId}.updated.admin", null, req.userId)
-                            ActionResponse.success()
-                        } else {
-                            ActionResponse.error("User not found")
-                        }
+                    } else {
+                        ActionResponse.error("Upload size not allowed")
                     }
-                } else {
-                    ActionResponse.error("Upload size not allowed")
+                }.let {
+                    call.respond(it)
                 }
-            }.let {
-                call.respond(it)
             }
         }
     }
@@ -687,38 +720,42 @@ fun Route.userRoute(client: HttpClient) {
         }
 
     post<UsersApi.Suspend> {
-        requireAuthorization { _, sess ->
-            if (!sess.isAdmin()) {
-                ActionResponse.error("Not an admin")
-            } else {
-                val req = call.receive<UserSuspendRequest>()
-                newSuspendedTransaction {
-                    modelPostgresOperation()
-                    createSuspension(sess.userId, req.userId, SuspensionType.Upload, req.reason, if (req.suspended) null else 0).also {
-                        if (it.success && req.suspended) {
-                            Playlist.update({
-                                Playlist.owner eq req.userId
-                            }) { p ->
-                                p[type] = EPlaylistType.Private
+        usersApiSuspendPostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                if (!sess.isAdmin()) {
+                    ActionResponse.error("Not an admin")
+                } else {
+                    val req = call.receive<UserSuspendRequest>()
+                    newSuspendedTransaction {
+                        modelPostgresOperation()
+                        createSuspension(sess.userId, req.userId, SuspensionType.Upload, req.reason, if (req.suspended) null else 0).also {
+                            if (it.success && req.suspended) {
+                                Playlist.update({
+                                    Playlist.owner eq req.userId
+                                }) { p ->
+                                    p[type] = EPlaylistType.Private
+                                }
                             }
                         }
                     }
+                }.let {
+                    call.respond(it)
                 }
-            }.let {
-                call.respond(it)
             }
         }
     }
 
     post<UsersApi.Silence> {
-        requireAuthorization { _, sess ->
-            val response = if (!sess.isAdmin()) {
-                ActionResponse.error("Not an admin")
-            } else {
-                val req = call.receive<UserReviewSilenceRequest>()
-                createSuspension(sess.userId, req.userId, SuspensionType.Review, req.reason, req.durationMinutes)
+        usersApiSilencePostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val response = if (!sess.isAdmin()) {
+                    ActionResponse.error("Not an admin")
+                } else {
+                    val req = call.receive<UserReviewSilenceRequest>()
+                    createSuspension(sess.userId, req.userId, SuspensionType.Review, req.reason, req.durationMinutes)
+                }
+                call.respond(response)
             }
-            call.respond(response)
         }
     }
 
@@ -845,126 +882,132 @@ fun Route.userRoute(client: HttpClient) {
     }
 
     get<UsersApi.Sessions> {
-        requireAuthorization { _, sess ->
-            val oauthSessions = transaction {
-                modelPostgresOperation()
-                RefreshTokenTable
-                    .join(OauthClient, JoinType.INNER, RefreshTokenTable.clientId, OauthClient.clientId)
-                    .selectAll()
-                    .where {
-                        (RefreshTokenTable.userName eq sess.userId) and (RefreshTokenTable.expiration greater NowExpression(RefreshTokenTable.expiration))
-                    }
-                    .orderBy(RefreshTokenTable.expiration to SortOrder.DESC)
-                    .map { row ->
-                        OauthSession(
-                            UserCrypto.encrypt(row[RefreshTokenTable.id].value),
-                            row[OauthClient.name],
-                            row[OauthClient.iconUrl],
-                            row[RefreshTokenTable.scope].split(",").mapNotNull { scope -> OauthScope.fromTag(scope) },
-                            row[RefreshTokenTable.expiration].toKotlinInstant()
-                        )
-                    }
+        usersApiSessionsGetSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val oauthSessions = transaction {
+                    modelPostgresOperation()
+                    RefreshTokenTable
+                        .join(OauthClient, JoinType.INNER, RefreshTokenTable.clientId, OauthClient.clientId)
+                        .selectAll()
+                        .where {
+                            (RefreshTokenTable.userName eq sess.userId) and (RefreshTokenTable.expiration greater NowExpression(RefreshTokenTable.expiration))
+                        }
+                        .orderBy(RefreshTokenTable.expiration to SortOrder.DESC)
+                        .map { row ->
+                            OauthSession(
+                                UserCrypto.encrypt(row[RefreshTokenTable.id].value),
+                                row[OauthClient.name],
+                                row[OauthClient.iconUrl],
+                                row[RefreshTokenTable.scope].split(",").mapNotNull { scope -> OauthScope.fromTag(scope) },
+                                row[RefreshTokenTable.expiration].toKotlinInstant()
+                            )
+                        }
+                }
+
+                val sessionId = call.request.cookies[cookieName]
+                val siteSessions = if (MongoClient.connected) {
+                    modelMongoOperation()
+                    MongoClient.sessions.find(MongoSession::session / Session::userId eq sess.userId)
+                        .sort(descending(MongoSession::expireAt))
+                        .map { row ->
+                            SiteSession(
+                                UserCrypto.encrypt(row.id),
+                                row.session.countryCode,
+                                row.expireAt,
+                                row.id == sessionId
+                            )
+                        }.toList()
+                } else { listOf() }
+
+                call.respond(SessionsData(oauthSessions, siteSessions))
             }
-
-            val sessionId = call.request.cookies[cookieName]
-            val siteSessions = if (MongoClient.connected) {
-                modelMongoOperation()
-                MongoClient.sessions.find(MongoSession::session / Session::userId eq sess.userId)
-                    .sort(descending(MongoSession::expireAt))
-                    .map { row ->
-                        SiteSession(
-                            UserCrypto.encrypt(row.id),
-                            row.session.countryCode,
-                            row.expireAt,
-                            row.id == sessionId
-                        )
-                    }.toList()
-            } else { listOf() }
-
-            call.respond(SessionsData(oauthSessions, siteSessions))
         }
     }
 
     delete<UsersApi.Sessions> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<SessionRevokeRequest>()
-            val userId = req.userId ?: sess.userId
-            val sessionId = call.request.cookies[cookieName]
+        usersApiSessionsDeleteSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<SessionRevokeRequest>()
+                val userId = req.userId ?: sess.userId
+                val sessionId = call.request.cookies[cookieName]
 
-            val response = if (userId != sess.userId && !sess.isAdmin()) {
-                ActionResponse.error("Not an admin or no reason given")
-            } else {
-                transaction {
-                    modelPostgresOperation()
-                    if (userId != sess.userId) {
-                        ModLog.insert(
-                            sess.userId,
-                            null,
-                            RevokeSessionsData(true, req.reason),
-                            userId
-                        )
+                val response = if (userId != sess.userId && !sess.isAdmin()) {
+                    ActionResponse.error("Not an admin or no reason given")
+                } else {
+                    transaction {
+                        modelPostgresOperation()
+                        if (userId != sess.userId) {
+                            ModLog.insert(
+                                sess.userId,
+                                null,
+                                RevokeSessionsData(true, req.reason),
+                                userId
+                            )
+                        }
+
+                        if (req.site != true) {
+                            DBTokenStore.deleteForUser(userId)
+                        }
+
+                        if (req.site != false && MongoClient.connected) {
+                            modelMongoOperation()
+                            MongoClient.sessions.deleteMany(
+                                and(MongoSession::id ne sessionId, MongoSession::session / Session::userId eq userId)
+                            )
+                        }
                     }
 
-                    if (req.site != true) {
-                        DBTokenStore.deleteForUser(userId)
-                    }
-
-                    if (req.site != false && MongoClient.connected) {
-                        modelMongoOperation()
-                        MongoClient.sessions.deleteMany(
-                            and(MongoSession::id ne sessionId, MongoSession::session / Session::userId eq userId)
-                        )
-                    }
+                    ActionResponse.success()
                 }
 
-                ActionResponse.success()
+                call.respond(response)
             }
-
-            call.respond(response)
         }
     }
 
     delete<UsersApi.SessionsById> { byId ->
-        requireAuthorization { _, sess ->
-            val req = call.receive<SessionRevokeRequest>()
-            val userId = req.userId ?: sess.userId
-            val id = UserCrypto.decrypt(byId.id)
-            val site = req.site
+        usersApiSessionsByIdDeleteSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<SessionRevokeRequest>()
+                val userId = req.userId ?: sess.userId
+                val id = UserCrypto.decrypt(byId.id)
+                val site = req.site
 
-            val response = if (userId != sess.userId && !sess.isAdmin()) {
-                ActionResponse.error("Not an admin")
-            } else if (site == null) {
-                ActionResponse.error("site property is required when deleting by id")
-            } else {
-                transaction {
-                    modelPostgresOperation()
-                    if (userId != sess.userId) {
-                        ModLog.insert(
-                            sess.userId,
-                            null,
-                            RevokeSessionsData(false, req.reason),
-                            userId
-                        )
-                    }
+                val response = if (userId != sess.userId && !sess.isAdmin()) {
+                    ActionResponse.error("Not an admin")
+                } else if (site == null) {
+                    ActionResponse.error("site property is required when deleting by id")
+                } else {
+                    transaction {
+                        modelPostgresOperation()
+                        if (userId != sess.userId) {
+                            ModLog.insert(
+                                sess.userId,
+                                null,
+                                RevokeSessionsData(false, req.reason),
+                                userId
+                            )
+                        }
 
-                    if (!site) {
-                        DBTokenStore.revokeRefreshToken(id)
-                        ActionResponse.success()
-                    } else if (!MongoClient.connected) {
-                        ActionResponse.error("Can't revoke in memory sessions")
-                    } else if (id == call.request.cookies[cookieName]) {
-                        ActionResponse.error("Can't revoke current session")
-                    } else {
-                        modelMongoOperation()
-                        MongoClient.sessions.deleteOne(
-                            MongoSession::id eq id
-                        )
-                        ActionResponse.success()
+                        if (!site) {
+                            DBTokenStore.revokeRefreshToken(id)
+                            ActionResponse.success()
+                        } else if (!MongoClient.connected) {
+                            ActionResponse.error("Can't revoke in memory sessions")
+                        } else if (id == call.request.cookies[cookieName]) {
+                            ActionResponse.error("Can't revoke current session")
+                        } else {
+                            modelMongoOperation()
+                            MongoClient.sessions.deleteOne(
+                                MongoSession::id eq id
+                            )
+                            ActionResponse.success()
+                        }
                     }
                 }
-            }
 
-            call.respond(response)
+                call.respond(response)
+            }
         }
     }
 
@@ -1036,198 +1079,157 @@ fun Route.userRoute(client: HttpClient) {
         }
 
     post<UsersApi.ChangeEmail> {
-        val req = call.receive<ChangeEmailRequest>()
+        usersApiChangeEmailPostSlots.withPermit {
+            val req = call.receive<ChangeEmailRequest>()
 
-        try {
-            val untrusted = parseJwtUntrusted(req.jwt)
-
-            val userId = untrusted.body.subject.toInt()
-            val newEmail = untrusted.body.get("email", String::class.java)
-            val action = untrusted.body.get("action", String::class.java)
-
-            newSuspendedTransaction {
-                modelPostgresOperation()
-                User.selectAll().where {
-                    User.id eq userId
-                }.firstOrNull()?.let { UserDao.wrapRow(it) }?.let { user ->
-                    try {
-                        // Check the user knows the current account password
-                        val isReclaim = action == "reclaim"
-                        if (user.email == newEmail) {
-                            // Ignore if this is a re-do
-                            ActionResponse.success()
-                        } else if (!isReclaim && user.emailChangedAt.toKotlinInstant() > Clock.System.now().minus(10.days)) {
-                            ActionResponse.error("You can only change email once every 10 days")
-                        } else if (isReclaim || user.password?.let { curPw -> Bcrypt.verify(req.password, curPw.toByteArray()) } == true) {
-                            // If the jwt is valid we can change the users email
-                            Jwts.parserBuilder()
-                                .setSigningKey(UserCrypto.key())
-                                .build()
-                                .parseClaimsJws(req.jwt)
-
-                            if (!listOf("email", "reclaim").contains(action)) throw JwtException("Bad claim")
-
-                            val success = User.update({
-                                User.id eq userId
-                            }) {
-                                it[email] = newEmail
-                                it[emailChangedAt] = NowExpression(emailChangedAt)
-                                it[updatedAt] = NowExpression(updatedAt)
-                            } > 0
-
-                            if (success) {
-                                UserLog.insert(userId, null, EmailChangedData(user.email, newEmail))
-
-                                // Log out user as sessions contain their email so they are now invalid
-                                DBTokenStore.deleteForUser(userId)
-                                MongoClient.deleteSessionsFor(userId)
-
-                                if (!isReclaim) {
-                                    sendReclaimMail(user)
-                                }
-
-                                ActionResponse.success()
-                            } else {
-                                ActionResponse.error("Failed to update email")
-                            }
-                        } else {
-                            ActionResponse.error("Current password incorrect")
-                        }
-                    } catch (_: ExposedSQLException) {
-                        ActionResponse.error("Email in use on another account")
-                    } catch (_: SignatureException) {
-                        ActionResponse.error("Token no longer valid")
-                    } catch (_: JwtException) {
-                        ActionResponse.error("Bad token")
-                    }
-                } ?: ActionResponse.error("User not found")
-            }
-        } catch (_: IllegalArgumentException) {
-            ActionResponse.error("Password too long")
-        } catch (_: ExpiredJwtException) {
-            ActionResponse.error("Link has expired")
-        } catch (_: JwtException) {
-            ActionResponse.error("Token is malformed")
-        }.let {
-            call.respond(it)
-        }
-    }
-
-    post<UsersApi.Reset> {
-        val req = call.receive<ResetRequest>()
-
-        val response = if (req.password != req.password2) {
-            ActionResponse.error("Passwords don't match")
-        } else if (req.password.length < 8) {
-            ActionResponse.error("Password too short")
-        } else {
             try {
-                val bcrypt = String(Bcrypt.hash(req.password, 12))
                 val untrusted = parseJwtUntrusted(req.jwt)
 
-                untrusted.body.subject.toInt().let { userId ->
-                    transaction {
-                        modelPostgresOperation()
-                        User.selectAll().where {
-                            User.id eq userId
-                        }.firstOrNull()?.let { UserDao.wrapRow(it) }?.let { user ->
-                            // If the jwt is valid we can reset the user's password :D
-                            try {
+                val userId = untrusted.body.subject.toInt()
+                val newEmail = untrusted.body.get("email", String::class.java)
+                val action = untrusted.body.get("action", String::class.java)
+
+                newSuspendedTransaction {
+                    modelPostgresOperation()
+                    User.selectAll().where {
+                        User.id eq userId
+                    }.firstOrNull()?.let { UserDao.wrapRow(it) }?.let { user ->
+                        try {
+                            // Check the user knows the current account password
+                            val isReclaim = action == "reclaim"
+                            if (user.email == newEmail) {
+                                // Ignore if this is a re-do
+                                ActionResponse.success()
+                            } else if (!isReclaim && user.emailChangedAt.toKotlinInstant() > Clock.System.now().minus(10.days)) {
+                                ActionResponse.error("You can only change email once every 10 days")
+                            } else if (isReclaim || user.password?.let { curPw -> Bcrypt.verify(req.password, curPw.toByteArray()) } == true) {
+                                // If the jwt is valid we can change the users email
                                 Jwts.parserBuilder()
-                                    .require("action", "reset")
-                                    .setSigningKey(UserCrypto.keyForUser(user))
+                                    .setSigningKey(UserCrypto.key())
                                     .build()
                                     .parseClaimsJws(req.jwt)
+
+                                if (!listOf("email", "reclaim").contains(action)) throw JwtException("Bad claim")
 
                                 val success = User.update({
                                     User.id eq userId
                                 }) {
-                                    it[password] = bcrypt
-
-                                    // The user must have received an email to reset their password so
-                                    // we can also activate their account
-                                    it[verifyToken] = null
-                                    it[active] = true
+                                    it[email] = newEmail
+                                    it[emailChangedAt] = NowExpression(emailChangedAt)
                                     it[updatedAt] = NowExpression(updatedAt)
                                 } > 0
 
                                 if (success) {
-                                    UserLog.insert(userId, null, PasswordChangedData)
+                                    UserLog.insert(userId, null, EmailChangedData(user.email, newEmail))
 
-                                    // Revoke all logins
+                                    // Log out user as sessions contain their email so they are now invalid
                                     DBTokenStore.deleteForUser(userId)
                                     MongoClient.deleteSessionsFor(userId)
 
+                                    if (!isReclaim) {
+                                        sendReclaimMail(user)
+                                    }
+
                                     ActionResponse.success()
                                 } else {
-                                    ActionResponse.error("Failed to update password")
+                                    ActionResponse.error("Failed to update email")
                                 }
-                            } catch (_: SignatureException) {
-                                // As previous password is included in key the signature will fail if the password
-                                // has changed since we sent the link
-                                ActionResponse.error("Reset token no longer valid")
-                            } catch (_: JwtException) {
-                                ActionResponse.error("Bad token")
-                            }.let { it to user.active }
-                        } ?: (ActionResponse.error("User not found") to false)
-                    }.let { (response, previousActive) ->
-                        if (response.success && !previousActive) {
-                            modelRabbitMqOperation()
-                            call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                            } else {
+                                ActionResponse.error("Current password incorrect")
+                            }
+                        } catch (_: ExposedSQLException) {
+                            ActionResponse.error("Email in use on another account")
+                        } catch (_: SignatureException) {
+                            ActionResponse.error("Token no longer valid")
+                        } catch (_: JwtException) {
+                            ActionResponse.error("Bad token")
                         }
-                        response
-                    }
+                    } ?: ActionResponse.error("User not found")
                 }
             } catch (_: IllegalArgumentException) {
                 ActionResponse.error("Password too long")
             } catch (_: ExpiredJwtException) {
-                ActionResponse.error("Password reset link has expired")
+                ActionResponse.error("Link has expired")
             } catch (_: JwtException) {
-                ActionResponse.error("Reset token is malformed")
+                ActionResponse.error("Token is malformed")
+            }.let {
+                call.respond(it)
             }
         }
-
-        call.respond(response)
     }
 
-    post<UsersApi.Me> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<AccountRequest>()
-            val newPassword = req.password
-            val currentPassword = req.currentPassword
+    post<UsersApi.Reset> {
+        usersApiResetPostSlots.withPermit {
+            val req = call.receive<ResetRequest>()
 
-            val response = if (newPassword == null || currentPassword == null) {
-                // Not a password reset request
-                ActionResponse.success()
-            } else if (newPassword != req.password2) {
+            val response = if (req.password != req.password2) {
                 ActionResponse.error("Passwords don't match")
-            } else if (newPassword.length < 8) {
+            } else if (req.password.length < 8) {
                 ActionResponse.error("Password too short")
             } else {
                 try {
-                    val bcrypt = String(Bcrypt.hash(newPassword, 12))
+                    val bcrypt = String(Bcrypt.hash(req.password, 12))
+                    val untrusted = parseJwtUntrusted(req.jwt)
 
-                    transaction {
-                        modelPostgresOperation()
-                        User.selectAll().where {
-                            User.id eq sess.userId
-                        }.firstOrNull()?.let { r ->
-                            if (r[User.password]?.let { curPw -> Bcrypt.verify(currentPassword, curPw.toByteArray()) } == true) {
-                                User.update({
-                                    User.id eq sess.userId
-                                }) {
-                                    it[password] = bcrypt
-                                    it[updatedAt] = NowExpression(updatedAt)
-                                }
-                                DBTokenStore.deleteForUser(sess.userId)
-                                ActionResponse.success()
-                            } else {
-                                ActionResponse.error("Current password incorrect")
+                    untrusted.body.subject.toInt().let { userId ->
+                        transaction {
+                            modelPostgresOperation()
+                            User.selectAll().where {
+                                User.id eq userId
+                            }.firstOrNull()?.let { UserDao.wrapRow(it) }?.let { user ->
+                                // If the jwt is valid we can reset the user's password :D
+                                try {
+                                    Jwts.parserBuilder()
+                                        .require("action", "reset")
+                                        .setSigningKey(UserCrypto.keyForUser(user))
+                                        .build()
+                                        .parseClaimsJws(req.jwt)
+
+                                    val success = User.update({
+                                        User.id eq userId
+                                    }) {
+                                        it[password] = bcrypt
+
+                                        // The user must have received an email to reset their password so
+                                        // we can also activate their account
+                                        it[verifyToken] = null
+                                        it[active] = true
+                                        it[updatedAt] = NowExpression(updatedAt)
+                                    } > 0
+
+                                    if (success) {
+                                        UserLog.insert(userId, null, PasswordChangedData)
+
+                                        // Revoke all logins
+                                        DBTokenStore.deleteForUser(userId)
+                                        MongoClient.deleteSessionsFor(userId)
+
+                                        ActionResponse.success()
+                                    } else {
+                                        ActionResponse.error("Failed to update password")
+                                    }
+                                } catch (_: SignatureException) {
+                                    // As previous password is included in key the signature will fail if the password
+                                    // has changed since we sent the link
+                                    ActionResponse.error("Reset token no longer valid")
+                                } catch (_: JwtException) {
+                                    ActionResponse.error("Bad token")
+                                }.let { it to user.active }
+                            } ?: (ActionResponse.error("User not found") to false)
+                        }.let { (response, previousActive) ->
+                            if (response.success && !previousActive) {
+                                modelRabbitMqOperation()
+                                call.pub("beatmaps", "user.$userId.updated.active", null, userId)
                             }
-                        } ?: ActionResponse.error("Account not found") // Shouldn't ever happen
+                            response
+                        }
                     }
                 } catch (_: IllegalArgumentException) {
                     ActionResponse.error("Password too long")
+                } catch (_: ExpiredJwtException) {
+                    ActionResponse.error("Password reset link has expired")
+                } catch (_: JwtException) {
+                    ActionResponse.error("Reset token is malformed")
                 }
             }
 
@@ -1235,176 +1237,231 @@ fun Route.userRoute(client: HttpClient) {
         }
     }
 
-    post<UsersApi.Follow> {
-        requireAuthorization(OauthScope.MANAGE_FOLLOW) { _, user ->
-            val req = call.receive<UserFollowRequest>()
+    post<UsersApi.Me> {
+        usersApiMePostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<AccountRequest>()
+                val newPassword = req.password
+                val currentPassword = req.currentPassword
 
-            if (req.userId == user.userId && req.following) {
-                throw UserApiException("Can't follow yourself")
-            }
+                val response = if (newPassword == null || currentPassword == null) {
+                    // Not a password reset request
+                    ActionResponse.success()
+                } else if (newPassword != req.password2) {
+                    ActionResponse.error("Passwords don't match")
+                } else if (newPassword.length < 8) {
+                    ActionResponse.error("Password too short")
+                } else {
+                    try {
+                        val bcrypt = String(Bcrypt.hash(newPassword, 12))
 
-            transaction {
-                modelPostgresOperation()
-                val shouldAlert = Follows.selectAll().where { (Follows.userId eq req.userId) and (Follows.followerId eq user.userId) }.empty()
-
-                Follows.upsert(conflictIndex = Follows.link) { follow ->
-                    follow[userId] = req.userId
-                    follow[followerId] = user.userId
-                    follow[since] = NowExpression(since)
-                    follow[upload] = req.upload
-                    follow[curation] = req.curation
-                    follow[collab] = req.collab
-                    follow[following] = req.following
-                }
-                if (shouldAlert) {
-                    val followedUser = UserDao.wrapRow(User.selectAll().where { User.id eq req.userId }.single())
-
-                    if (followedUser.followAlerts) {
-                        Alert.insert(
-                            "New Follower",
-                            "@${user.uniqueName} is now following you!",
-                            EAlertType.Follow,
-                            req.userId
-                        )
-                        updateAlertCount(req.userId)
+                        transaction {
+                            modelPostgresOperation()
+                            User.selectAll().where {
+                                User.id eq sess.userId
+                            }.firstOrNull()?.let { r ->
+                                if (r[User.password]?.let { curPw -> Bcrypt.verify(currentPassword, curPw.toByteArray()) } == true) {
+                                    User.update({
+                                        User.id eq sess.userId
+                                    }) {
+                                        it[password] = bcrypt
+                                        it[updatedAt] = NowExpression(updatedAt)
+                                    }
+                                    DBTokenStore.deleteForUser(sess.userId)
+                                    ActionResponse.success()
+                                } else {
+                                    ActionResponse.error("Current password incorrect")
+                                }
+                            } ?: ActionResponse.error("Account not found") // Shouldn't ever happen
+                        }
+                    } catch (_: IllegalArgumentException) {
+                        ActionResponse.error("Password too long")
                     }
                 }
+
+                call.respond(response)
             }
-            call.respond(HttpStatusCode.OK)
+        }
+    }
+
+    post<UsersApi.Follow> {
+        usersApiFollowPostSlots.withPermit {
+            requireAuthorization(OauthScope.MANAGE_FOLLOW) { _, user ->
+                val req = call.receive<UserFollowRequest>()
+
+                if (req.userId == user.userId && req.following) {
+                    throw UserApiException("Can't follow yourself")
+                }
+
+                transaction {
+                    modelPostgresOperation()
+                    val shouldAlert = Follows.selectAll().where { (Follows.userId eq req.userId) and (Follows.followerId eq user.userId) }.empty()
+
+                    Follows.upsert(conflictIndex = Follows.link) { follow ->
+                        follow[userId] = req.userId
+                        follow[followerId] = user.userId
+                        follow[since] = NowExpression(since)
+                        follow[upload] = req.upload
+                        follow[curation] = req.curation
+                        follow[collab] = req.collab
+                        follow[following] = req.following
+                    }
+                    if (shouldAlert) {
+                        val followedUser = UserDao.wrapRow(User.selectAll().where { User.id eq req.userId }.single())
+
+                        if (followedUser.followAlerts) {
+                            Alert.insert(
+                                "New Follower",
+                                "@${user.uniqueName} is now following you!",
+                                EAlertType.Follow,
+                                req.userId
+                            )
+                            updateAlertCount(req.userId)
+                        }
+                    }
+                }
+                call.respond(HttpStatusCode.OK)
+            }
         }
     }
 
     get<UsersApi.Find> {
-        val user = transaction {
-            modelPostgresOperation()
-            User.selectAll().where {
-                User.hash.eq(it.id) and User.active
-            }.firstOrNull()?.let { row -> UserDetail.from(row) }
-        }
+        usersApiFindGetSlots.withPermit {
+            val user = transaction {
+                modelPostgresOperation()
+                User.selectAll().where {
+                    User.hash.eq(it.id) and User.active
+                }.firstOrNull()?.let { row -> UserDetail.from(row) }
+            }
 
-        if (user == null) {
-            call.respond(HttpStatusCode.NotFound)
-        } else {
-            call.respond(user)
+            if (user == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                call.respond(user)
+            }
         }
     }
 
     get<UsersApi.List> { req ->
-        val us = transaction {
-            modelPostgresOperation()
-            val userAlias = User.select(User.upvotes, User.id, User.name, User.uniqueName, User.description, User.avatar, User.hash, User.discordId).where {
-                Op.TRUE and User.active
-            }.orderBy(User.upvotes, SortOrder.DESC).limit(req.page.or(0)).alias("u")
+        usersApiListGetSlots.withPermit {
+            val us = transaction {
+                modelPostgresOperation()
+                val userAlias = User.select(User.upvotes, User.id, User.name, User.uniqueName, User.description, User.avatar, User.hash, User.discordId).where {
+                    Op.TRUE and User.active
+                }.orderBy(User.upvotes, SortOrder.DESC).limit(req.page.or(0)).alias("u")
 
-            val query = userAlias
-                .join(Beatmap, JoinType.INNER, userAlias[User.id], Beatmap.uploader) {
-                    Beatmap.deletedAt.isNull()
+                val query = userAlias
+                    .join(Beatmap, JoinType.INNER, userAlias[User.id], Beatmap.uploader) {
+                        Beatmap.deletedAt.isNull()
+                    }
+                    .join(Versions, JoinType.INNER, onColumn = Beatmap.id, otherColumn = Versions.mapId, additionalConstraint = { Versions.state eq EMapState.Published })
+                    .select(
+                        Beatmap.uploader,
+                        Beatmap.id.count(),
+                        userAlias[User.id],
+                        userAlias[User.upvotes],
+                        userAlias[User.name],
+                        userAlias[User.uniqueName],
+                        userAlias[User.description],
+                        userAlias[User.avatar],
+                        userAlias[User.hash],
+                        userAlias[User.discordId],
+                        Beatmap.downVotesInt.sum(),
+                        Beatmap.bpm.avg(),
+                        Beatmap.score.avg(3),
+                        Beatmap.duration.avg(0),
+                        countWithFilter(Beatmap.ranked or Beatmap.blRanked),
+                        Beatmap.uploaded.min(),
+                        Beatmap.uploaded.max()
+                    )
+                    .groupBy(Beatmap.uploader, userAlias[User.id], userAlias[User.upvotes], userAlias[User.name], userAlias[User.uniqueName], userAlias[User.description], userAlias[User.avatar], userAlias[User.hash], userAlias[User.discordId])
+                    .orderBy(userAlias[User.upvotes], SortOrder.DESC)
+
+                query.toList().map {
+                    val dao = UserDao.wrapRow(it, userAlias)
+
+                    val uniqueName = dao.uniqueName
+                    UserDetail(
+                        it[Beatmap.uploader].value,
+                        uniqueName ?: dao.name,
+                        dao.description,
+                        uniqueName != null,
+                        avatar = UserDetail.getAvatar(dao),
+                        stats = UserStats(
+                            dao.upvotes,
+                            it[Beatmap.downVotesInt.sum()] ?: 0,
+                            it[Beatmap.id.count()].toInt(),
+                            it[countWithFilter(Beatmap.ranked or Beatmap.blRanked)] ?: 0,
+                            it[Beatmap.bpm.avg()]?.toFloat() ?: 0f,
+                            it[Beatmap.score.avg(3)]?.movePointRight(2)?.toFloat() ?: 0f,
+                            it[Beatmap.duration.avg(0)]?.toFloat() ?: 0f,
+                            it[Beatmap.uploaded.min()]?.toKotlinInstant(),
+                            it[Beatmap.uploaded.max()]?.toKotlinInstant()
+                        ),
+                        type = if (dao.discordId != null) AccountType.DISCORD else AccountType.SIMPLE
+                    )
                 }
-                .join(Versions, JoinType.INNER, onColumn = Beatmap.id, otherColumn = Versions.mapId, additionalConstraint = { Versions.state eq EMapState.Published })
-                .select(
-                    Beatmap.uploader,
-                    Beatmap.id.count(),
-                    userAlias[User.id],
-                    userAlias[User.upvotes],
-                    userAlias[User.name],
-                    userAlias[User.uniqueName],
-                    userAlias[User.description],
-                    userAlias[User.avatar],
-                    userAlias[User.hash],
-                    userAlias[User.discordId],
-                    Beatmap.downVotesInt.sum(),
-                    Beatmap.bpm.avg(),
-                    Beatmap.score.avg(3),
-                    Beatmap.duration.avg(0),
-                    countWithFilter(Beatmap.ranked or Beatmap.blRanked),
-                    Beatmap.uploaded.min(),
-                    Beatmap.uploaded.max()
-                )
-                .groupBy(Beatmap.uploader, userAlias[User.id], userAlias[User.upvotes], userAlias[User.name], userAlias[User.uniqueName], userAlias[User.description], userAlias[User.avatar], userAlias[User.hash], userAlias[User.discordId])
-                .orderBy(userAlias[User.upvotes], SortOrder.DESC)
-
-            query.toList().map {
-                val dao = UserDao.wrapRow(it, userAlias)
-
-                val uniqueName = dao.uniqueName
-                UserDetail(
-                    it[Beatmap.uploader].value,
-                    uniqueName ?: dao.name,
-                    dao.description,
-                    uniqueName != null,
-                    avatar = UserDetail.getAvatar(dao),
-                    stats = UserStats(
-                        dao.upvotes,
-                        it[Beatmap.downVotesInt.sum()] ?: 0,
-                        it[Beatmap.id.count()].toInt(),
-                        it[countWithFilter(Beatmap.ranked or Beatmap.blRanked)] ?: 0,
-                        it[Beatmap.bpm.avg()]?.toFloat() ?: 0f,
-                        it[Beatmap.score.avg(3)]?.movePointRight(2)?.toFloat() ?: 0f,
-                        it[Beatmap.duration.avg(0)]?.toFloat() ?: 0f,
-                        it[Beatmap.uploaded.min()]?.toKotlinInstant(),
-                        it[Beatmap.uploaded.max()]?.toKotlinInstant()
-                    ),
-                    type = if (dao.discordId != null) AccountType.DISCORD else AccountType.SIMPLE
-                )
             }
-        }
 
-        call.respond(UserSearchResponse(us))
+            call.respond(UserSearchResponse(us))
+        }
     }
 
     val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
     get<UsersApi.UserPlaylist> {
-        val (maps, user) = transaction {
-            modelPostgresOperation()
-            Beatmap.joinVersions()
-                .selectAll().where {
-                    Beatmap.id.inSubQuery(
-                        Beatmap.select(Beatmap.id).where { (Beatmap.uploader eq it.id?.orNull()) and Beatmap.deletedAt.isNull() }
-                            .let { q ->
-                                if (it.collabs) {
-                                    q.union(Collaboration.select(Collaboration.mapId).where { Collaboration.collaboratorId eq it.id?.orNull() and Collaboration.accepted })
-                                } else {
-                                    q
+        usersApiUserPlaylistGetSlots.withPermit {
+            val (maps, user) = transaction {
+                modelPostgresOperation()
+                Beatmap.joinVersions()
+                    .selectAll().where {
+                        Beatmap.id.inSubQuery(
+                            Beatmap.select(Beatmap.id).where { (Beatmap.uploader eq it.id?.orNull()) and Beatmap.deletedAt.isNull() }
+                                .let { q ->
+                                    if (it.collabs) {
+                                        q.union(Collaboration.select(Collaboration.mapId).where { Collaboration.collaboratorId eq it.id?.orNull() and Collaboration.accepted })
+                                    } else {
+                                        q
+                                    }
                                 }
-                            }
+                        )
+                    }.complexToBeatmap().sortedByDescending { b -> b.uploaded } to User.selectAll().where { User.id eq it.id?.orNull() and User.active }.firstOrNull()?.let { row -> UserDetail.from(row) }
+            }
+
+            if (user == null) {
+                call.respond(HttpStatusCode.NotFound)
+                return@get
+            }
+
+            val playlistSongs = maps.mapNotNull { map ->
+                map.versions.values.firstOrNull { v -> v.state == EMapState.Published }?.let { v ->
+                    PlaylistSong(
+                        toHexString(map.id.value),
+                        v.hash,
+                        map.name
                     )
-                }.complexToBeatmap().sortedByDescending { b -> b.uploaded } to User.selectAll().where { User.id eq it.id?.orNull() and User.active }.firstOrNull()?.let { row -> UserDetail.from(row) }
-        }
-
-        if (user == null) {
-            call.respond(HttpStatusCode.NotFound)
-            return@get
-        }
-
-        val playlistSongs = maps.mapNotNull { map ->
-            map.versions.values.firstOrNull { v -> v.state == EMapState.Published }?.let { v ->
-                PlaylistSong(
-                    toHexString(map.id.value),
-                    v.hash,
-                    map.name
-                )
+                }
             }
-        }
 
-        val imageStr = Base64.getEncoder().encodeToString(
-            userPlaylistSlots.withPermit {
-                downloadPlaylistAvatar(client, user.avatar)
-            }
-        )
-
-        val dateStr = formatter.format(LocalDateTime.now())
-
-        call.response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"${user.name}-$dateStr.bplist\"")
-        call.respond(
-            Playlist(
-                "Maps by ${user.name} (${playlistSongs.size} Total)",
-                user.name,
-                "All maps by ${user.name} ($dateStr)",
-                imageStr,
-                PlaylistCustomData("${Config.apiBase(true)}/users/id/${user.id}/playlist"),
-                playlistSongs
+            val imageStr = Base64.getEncoder().encodeToString(
+                userPlaylistSlots.withPermit {
+                    downloadPlaylistAvatar(client, user.avatar)
+                }
             )
-        )
+
+            val dateStr = formatter.format(LocalDateTime.now())
+
+            call.response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"${user.name}-$dateStr.bplist\"")
+            call.respond(
+                Playlist(
+                    "Maps by ${user.name} (${playlistSongs.size} Total)",
+                    user.name,
+                    "All maps by ${user.name} ($dateStr)",
+                    imageStr,
+                    PlaylistCustomData("${Config.apiBase(true)}/users/id/${user.id}/playlist"),
+                    playlistSongs
+                )
+            )
+        }
     }
 
     suspend fun statsForUser(user: UserDao) = newSuspendedTransaction {
@@ -1481,83 +1538,91 @@ fun Route.userRoute(client: HttpClient) {
         UserDao.wrapRow(User.joinPatreon().selectAll().where(where).handlePatreon().firstOrNull() ?: throw NotFoundException())
 
     get<UsersApi.Me> {
-        requireAuthorization { _, sess ->
-            val detail = newSuspendedTransaction {
-                modelPostgresOperation()
-                val user = userBy {
-                    User.id eq sess.userId
+        usersApiMeGetSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val detail = newSuspendedTransaction {
+                    modelPostgresOperation()
+                    val user = userBy {
+                        User.id eq sess.userId
+                    }
+
+                    val dualAccount = user.discordId != null && user.email != null && user.uniqueName != null
+                    val followData = followData(sess.userId, sess.userId)
+
+                    UserDetail.from(user, stats = statsForUser(user), followData = followData, description = true, patreon = true).let { usr ->
+                        val tmp = usr.copy(email = user.email, blurnsfw = user.blurnsfw)
+                        if (dualAccount) {
+                            tmp.copy(type = AccountType.DUAL)
+                        } else {
+                            tmp
+                        }
+                    }.withAccountStanding(user.id.value, sess.isAdmin())
                 }
 
-                val dualAccount = user.discordId != null && user.email != null && user.uniqueName != null
-                val followData = followData(sess.userId, sess.userId)
-
-                UserDetail.from(user, stats = statsForUser(user), followData = followData, description = true, patreon = true).let { usr ->
-                    val tmp = usr.copy(email = user.email, blurnsfw = user.blurnsfw)
-                    if (dualAccount) {
-                        tmp.copy(type = AccountType.DUAL)
-                    } else {
-                        tmp
-                    }
-                }.withAccountStanding(user.id.value, sess.isAdmin())
+                call.respond(detail)
             }
-
-            call.respond(detail)
         }
     }
 
     getWithOptions<MapsApi.UserId>("Get user info".responds(ok<UserDetail>(), notFound())) {
-        optionalAuthorization(OauthScope.FOLLOW) { _, sess ->
-            val userDetail = newSuspendedTransaction {
-                modelPostgresOperation()
-                val user = userBy {
-                    (User.id eq it.id?.orNull()) and User.active
-                }
-                val followData = followData(user.id.value, sess?.userId)
-
-                val showAllStanding = sess?.isAdmin() == true
-                UserDetail.from(user, stats = statsForUser(user), followData = followData, description = true, patreon = true).let {
-                    if (showAllStanding) {
-                        it.copy(uploadLimit = user.uploadLimit, vivifyLimit = user.vivifyLimit)
-                    } else {
-                        it
+        mapsApiUserIdGetSlots.withPermit {
+            optionalAuthorization(OauthScope.FOLLOW) { _, sess ->
+                val userDetail = newSuspendedTransaction {
+                    modelPostgresOperation()
+                    val user = userBy {
+                        (User.id eq it.id?.orNull()) and User.active
                     }
-                }.withAccountStanding(user.id.value, showAllStanding)
+                    val followData = followData(user.id.value, sess?.userId)
+
+                    val showAllStanding = sess?.isAdmin() == true
+                    UserDetail.from(user, stats = statsForUser(user), followData = followData, description = true, patreon = true).let {
+                        if (showAllStanding) {
+                            it.copy(uploadLimit = user.uploadLimit, vivifyLimit = user.vivifyLimit)
+                        } else {
+                            it
+                        }
+                    }.withAccountStanding(user.id.value, showAllStanding)
+                }
+
+                call.respond(userDetail)
+            }
+        }
+    }
+
+    getWithOptions<MapsApi.UserIds>("Get user info".responds(ok<UserDetail>(), notFound())) {
+        mapsApiUserIdsGetSlots.withPermit {
+            val ids = it.ids.split(",").mapNotNull { id -> id.toIntOrNull() }.take(50)
+
+            val userDetail = transaction {
+                modelPostgresOperation()
+                User
+                    .selectAll()
+                    .where {
+                        (User.id inList ids) and User.active
+                    }
+                    .map { row ->
+                        UserDetail.from(row)
+                    }
             }
 
             call.respond(userDetail)
         }
     }
 
-    getWithOptions<MapsApi.UserIds>("Get user info".responds(ok<UserDetail>(), notFound())) {
-        val ids = it.ids.split(",").mapNotNull { id -> id.toIntOrNull() }.take(50)
-
-        val userDetail = transaction {
-            modelPostgresOperation()
-            User
-                .selectAll()
-                .where {
-                    (User.id inList ids) and User.active
-                }
-                .map { row ->
-                    UserDetail.from(row)
-                }
-        }
-
-        call.respond(userDetail)
-    }
-
     getWithOptions<MapsApi.UserName>("Get user info by name".responds(ok<UserDetail>(), notFound())) {
-        val showAllStanding = call.sessions.get<Session>()?.isAdmin() == true
-        val userDetail = newSuspendedTransaction {
-            modelPostgresOperation()
-            val user = userBy {
-                (User.uniqueName eq it.name) and User.active
+        mapsApiUserNameGetSlots.withPermit {
+            val showAllStanding = call.sessions.get<Session>()?.isAdmin() == true
+            val userDetail = newSuspendedTransaction {
+                modelPostgresOperation()
+                val user = userBy {
+                    (User.uniqueName eq it.name) and User.active
+                }
+
+                UserDetail.from(user, stats = statsForUser(user), description = true, patreon = true).withAccountStanding(user.id.value, showAllStanding)
             }
 
-            UserDetail.from(user, stats = statsForUser(user), description = true, patreon = true).withAccountStanding(user.id.value, showAllStanding)
+            call.respond(userDetail)
         }
-
-        call.respond(userDetail)
     }
 
     fun getFollowerData(page: Long, joinOn: Column<EntityID<Int>>, condition: SqlExpressionBuilder.() -> Op<Boolean>) = transaction {
@@ -1588,22 +1653,26 @@ fun Route.userRoute(client: HttpClient) {
     }
 
     get<UsersApi.Following> {
-        val users = getFollowerData(it.page.or(0), Follows.followerId) {
-            Follows.userId eq it.user?.orNull()
-        }
-
-        call.respond(users)
-    }
-
-    get<UsersApi.FollowedBy> {
-        requireAuthorization(OauthScope.FOLLOW) { _, sess ->
-            if (it.user?.orNull() != sess.userId) call.respond(HttpStatusCode.Forbidden, ActionResponse.error())
-
-            val users = getFollowerData(it.page.or(0), Follows.userId) {
-                Follows.followerId eq it.user?.orNull()
+        usersApiFollowingGetSlots.withPermit {
+            val users = getFollowerData(it.page.or(0), Follows.followerId) {
+                Follows.userId eq it.user?.orNull()
             }
 
             call.respond(users)
+        }
+    }
+
+    get<UsersApi.FollowedBy> {
+        usersApiFollowedByGetSlots.withPermit {
+            requireAuthorization(OauthScope.FOLLOW) { _, sess ->
+                if (it.user?.orNull() != sess.userId) call.respond(HttpStatusCode.Forbidden, ActionResponse.error())
+
+                val users = getFollowerData(it.page.or(0), Follows.userId) {
+                    Follows.followerId eq it.user?.orNull()
+                }
+
+                call.respond(users)
+            }
         }
     }
 
@@ -1624,89 +1693,93 @@ fun Route.userRoute(client: HttpClient) {
     )
 
     getWithOptions<UsersApi.Search>("Search for users".responds(ok<UserSearchResponse>())) { req ->
-        if (!SolrHelper.enabled) {
-            call.respond(legacySearch(req.q))
-            return@getWithOptions
-        }
+        usersApiSearchGetSlots.withPermit {
+            if (!SolrHelper.enabled) {
+                call.respond(legacySearch(req.q))
+                return@getWithOptions
+            }
 
-        val searchInfo = (req.q ?: "").let { query -> SolrSearchParams(query, query, listOf()) }
+            val searchInfo = (req.q ?: "").let { query -> SolrSearchParams(query, query, listOf()) }
 
-        newSuspendedTransaction {
-            modelPostgresOperation()
-            val response = UserSolr.newQuery()
-                .let { q ->
-                    searchInfo.applyQuery(q)
-                }
-                .let { q ->
-                    UserSolr.addSortArgs(q, req.sort.or(UserSearchSort.RELEVANCE), req.order.or(ApiOrder.DESC))
-                }
-                .notNull(req.curator) { o -> UserSolr.curator eq o }
-                .notNull(req.verified) { o -> UserSolr.verifiedMapper eq o }
-                .also { q ->
-                    q.apply(UserSolr.totalUpvotes.betweenNullableInc(req.minUpvotes?.orNull(), req.maxUpvotes?.orNull()))
-                    q.apply(UserSolr.totalDownvotes.betweenNullableInc(req.minDownvotes?.orNull(), req.maxDownvotes?.orNull()))
-                    q.apply(UserSolr.totalMaps.betweenNullableInc(req.minMaps?.orNull(), req.maxMaps?.orNull()))
-                    q.apply(UserSolr.rankedMaps.betweenNullableInc(req.minRankedMaps?.orNull(), req.maxRankedMaps?.orNull()))
+            newSuspendedTransaction {
+                modelPostgresOperation()
+                val response = UserSolr.newQuery()
+                    .let { q ->
+                        searchInfo.applyQuery(q)
+                    }
+                    .let { q ->
+                        UserSolr.addSortArgs(q, req.sort.or(UserSearchSort.RELEVANCE), req.order.or(ApiOrder.DESC))
+                    }
+                    .notNull(req.curator) { o -> UserSolr.curator eq o }
+                    .notNull(req.verified) { o -> UserSolr.verifiedMapper eq o }
+                    .also { q ->
+                        q.apply(UserSolr.totalUpvotes.betweenNullableInc(req.minUpvotes?.orNull(), req.maxUpvotes?.orNull()))
+                        q.apply(UserSolr.totalDownvotes.betweenNullableInc(req.minDownvotes?.orNull(), req.maxDownvotes?.orNull()))
+                        q.apply(UserSolr.totalMaps.betweenNullableInc(req.minMaps?.orNull(), req.maxMaps?.orNull()))
+                        q.apply(UserSolr.rankedMaps.betweenNullableInc(req.minRankedMaps?.orNull(), req.maxRankedMaps?.orNull()))
 
-                    q.apply(UserSolr.firstUpload.betweenNullableInc(req.firstUploadAfter?.orNull(), req.firstUploadBefore?.orNull()))
-                    q.apply(UserSolr.lastUpload.betweenNullableInc(req.lastUploadAfter?.orNull(), req.lastUploadBefore?.orNull()))
-                }
-                .paged(req.page.or(0).toInt(), req.pageSize.or(20).coerceIn(1, 100))
-                .let { query ->
-                    modelSolrOperation()
-                    UserSolr.query(query)
-                }
-
-            val userIds = response.results.mapNotNull { it[UserSolr.id] }
-            val statsLookup = response.results.associateBy { it[UserSolr.id] }
-            val numRecords = response.results.numFound.toInt()
-            val results = SolrResults(userIds, response.qTime, numRecords)
-
-            val users = User
-                .selectAll()
-                .where {
-                    User.id inList results.mapIds and User.active
-                }
-                .map { row ->
-                    val statsFromSolr = statsLookup[row[User.id].value]?.let { s ->
-                        UserStats(
-                            s[UserSolr.totalUpvotes],
-                            s[UserSolr.totalDownvotes],
-                            s[UserSolr.totalMaps],
-                            s[UserSolr.rankedMaps],
-                            s[UserSolr.avgBpm],
-                            s[UserSolr.avgScore],
-                            s[UserSolr.avgDuration],
-                            s[UserSolr.firstUpload],
-                            s[UserSolr.lastUpload]
-                        )
+                        q.apply(UserSolr.firstUpload.betweenNullableInc(req.firstUploadAfter?.orNull(), req.firstUploadBefore?.orNull()))
+                        q.apply(UserSolr.lastUpload.betweenNullableInc(req.lastUploadAfter?.orNull(), req.lastUploadBefore?.orNull()))
+                    }
+                    .paged(req.page.or(0).toInt(), req.pageSize.or(20).coerceIn(1, 100))
+                    .let { query ->
+                        modelSolrOperation()
+                        UserSolr.query(query)
                     }
 
-                    UserDetail.from(
-                        row,
-                        stats = statsFromSolr
-                    )
-                }
-                .sortedBy { results.order[it.id] }
+                val userIds = response.results.mapNotNull { it[UserSolr.id] }
+                val statsLookup = response.results.associateBy { it[UserSolr.id] }
+                val numRecords = response.results.numFound.toInt()
+                val results = SolrResults(userIds, response.qTime, numRecords)
 
-            call.respond(UserSearchResponse(users, results.searchInfo))
+                val users = User
+                    .selectAll()
+                    .where {
+                        User.id inList results.mapIds and User.active
+                    }
+                    .map { row ->
+                        val statsFromSolr = statsLookup[row[User.id].value]?.let { s ->
+                            UserStats(
+                                s[UserSolr.totalUpvotes],
+                                s[UserSolr.totalDownvotes],
+                                s[UserSolr.totalMaps],
+                                s[UserSolr.rankedMaps],
+                                s[UserSolr.avgBpm],
+                                s[UserSolr.avgScore],
+                                s[UserSolr.avgDuration],
+                                s[UserSolr.firstUpload],
+                                s[UserSolr.lastUpload]
+                            )
+                        }
+
+                        UserDetail.from(
+                            row,
+                            stats = statsFromSolr
+                        )
+                    }
+                    .sortedBy { results.order[it.id] }
+
+                call.respond(UserSearchResponse(users, results.searchInfo))
+            }
         }
     }
 
     getWithOptions<UsersApi.Curators> {
-        val users = transaction {
-            modelPostgresOperation()
-            User
-                .selectAll()
-                .where { User.curator eq Op.TRUE }
-                .orderBy(User.seniorCurator to SortOrder.DESC, User.uniqueName to SortOrder.ASC)
-                .limit(50)
-                .map { row ->
-                    UserDetail.from(row, description = true)
-                }
-        }
+        usersApiCuratorsGetSlots.withPermit {
+            val users = transaction {
+                modelPostgresOperation()
+                User
+                    .selectAll()
+                    .where { User.curator eq Op.TRUE }
+                    .orderBy(User.seniorCurator to SortOrder.DESC, User.uniqueName to SortOrder.ASC)
+                    .limit(50)
+                    .map { row ->
+                        UserDetail.from(row, description = true)
+                    }
+            }
 
-        call.respond(users)
+            call.respond(users)
+        }
     }
 }
 

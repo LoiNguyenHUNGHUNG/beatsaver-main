@@ -26,6 +26,7 @@ import io.beatmaps.common.dbo.reviewerAlias
 import io.beatmaps.common.or
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelRabbitMqOperation
@@ -37,6 +38,8 @@ import io.ktor.server.resources.get
 import io.ktor.server.resources.post
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.UseSerializers
 import org.jetbrains.exposed.sql.Column
 import org.jetbrains.exposed.sql.JoinType
@@ -47,6 +50,9 @@ import org.jetbrains.exposed.sql.insertIgnore
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
+
+private val bookmarksApiBookmarkPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val bookmarksApiBookmarksGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 @Resource("/api")
 class BookmarksApi {
@@ -128,53 +134,57 @@ fun removeBookmark(mapId: Int, playlistId: Int) =
 
 fun Route.bookmarkRoute() {
     post<BookmarksApi.Bookmark> {
-        val req = call.receive<BookmarkRequest>()
+        bookmarksApiBookmarkPostSlots.withPermit {
+            val req = call.receive<BookmarkRequest>()
 
-        requireAuthorization(OauthScope.BOOKMARKS) { _, sess ->
+            requireAuthorization(OauthScope.BOOKMARKS) { _, sess ->
 
-            val (updateCount, playlistId) = transaction {
-                modelPostgresOperation()
-                (req.key?.toIntOrNull(16) ?: req.hash?.let { mapIdForHash(it) })?.let { mapId ->
-                    val playlistId = getNewId(sess.userId)
+                val (updateCount, playlistId) = transaction {
+                    modelPostgresOperation()
+                    (req.key?.toIntOrNull(16) ?: req.hash?.let { mapIdForHash(it) })?.let { mapId ->
+                        val playlistId = getNewId(sess.userId)
 
-                    if (req.bookmarked) {
-                        addBookmark(mapId, sess.userId, playlistId)
-                    } else {
-                        removeBookmark(mapId, playlistId)
-                    } to playlistId
-                } ?: (0 to null)
+                        if (req.bookmarked) {
+                            addBookmark(mapId, sess.userId, playlistId)
+                        } else {
+                            removeBookmark(mapId, playlistId)
+                        } to playlistId
+                    } ?: (0 to null)
+                }
+
+                if (playlistId != null) {
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "playlists.$playlistId.updated", null, playlistId)
+                }
+
+                call.respond(BookmarkUpdateResponse(updateCount > 0))
             }
-
-            if (playlistId != null) {
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "playlists.$playlistId.updated", null, playlistId)
-            }
-
-            call.respond(BookmarkUpdateResponse(updateCount > 0))
         }
     }
 
     get<BookmarksApi.Bookmarks> {
-        requireAuthorization(OauthScope.BOOKMARKS) { _, sess ->
-            val maps = transaction {
-                modelPostgresOperation()
-                PlaylistMap
-                    .join(reviewerAlias, JoinType.LEFT, PlaylistMap.playlistId, reviewerAlias[User.bookmarksId])
-                    .join(Beatmap, JoinType.LEFT, PlaylistMap.mapId, Beatmap.id)
-                    .joinVersions(false)
-                    .joinUploader()
-                    .joinCurator()
-                    .selectAll()
-                    .where { Beatmap.deletedAt.isNull() and (reviewerAlias[User.id] eq sess.userId) }
-                    .orderBy(PlaylistMap.order)
-                    .limit(it.page.or(0), it.pageSize.or(20).coerceIn(1, 100))
-                    .complexToBeatmap()
-                    .map {
-                        MapDetail.from(it, cdnPrefix())
-                    }
-            }
+        bookmarksApiBookmarksGetSlots.withPermit {
+            requireAuthorization(OauthScope.BOOKMARKS) { _, sess ->
+                val maps = transaction {
+                    modelPostgresOperation()
+                    PlaylistMap
+                        .join(reviewerAlias, JoinType.LEFT, PlaylistMap.playlistId, reviewerAlias[User.bookmarksId])
+                        .join(Beatmap, JoinType.LEFT, PlaylistMap.mapId, Beatmap.id)
+                        .joinVersions(false)
+                        .joinUploader()
+                        .joinCurator()
+                        .selectAll()
+                        .where { Beatmap.deletedAt.isNull() and (reviewerAlias[User.id] eq sess.userId) }
+                        .orderBy(PlaylistMap.order)
+                        .limit(it.page.or(0), it.pageSize.or(20).coerceIn(1, 100))
+                        .complexToBeatmap()
+                        .map {
+                            MapDetail.from(it, cdnPrefix())
+                        }
+                }
 
-            call.respond(BookmarkResponse(maps))
+                call.respond(BookmarkResponse(maps))
+            }
         }
     }
 }

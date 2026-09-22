@@ -49,6 +49,8 @@ import org.jetbrains.exposed.sql.update
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
+private val patreonHookPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 private val patreonWebhookSecret = System.getenv("PATREON_WEBHOOK_SECRET") ?: "insecure-secret"
 
 val patreonProvider = OAuthServerSettings.OAuth2ServerSettings(
@@ -198,40 +200,42 @@ fun Route.patreonLink(client: HttpClient) {
     }
 
     post<PatreonHook> {
-        val hookContent = call.receiveText()
+        patreonHookPostSlots.withPermit {
+            val hookContent = call.receiveText()
 
-        val signature = call.request.header("X-Patreon-Signature")
-        val event = call.request.header("X-Patreon-Event")
+            val signature = call.request.header("X-Patreon-Signature")
+            val event = call.request.header("X-Patreon-Event")
 
-        if (signature != signature(hookContent, patreonWebhookSecret)) {
-            throw BadRequestException("Invalid signature")
-        }
-
-        transaction {
-            modelPostgresOperation()
-            PatreonLog.insert {
-                it[type] = event ?: ""
-                it[text] = hookContent
-                it[time] = NowExpression(time)
+            if (signature != signature(hookContent, patreonWebhookSecret)) {
+                throw BadRequestException("Invalid signature")
             }
-        }
 
-        val hook = json.decodeFromString<PatreonResponse>(hookContent)
-        val user = hook.getIncluded<PatreonUser>(PatreonUser).first()
-        val membership = hook.getIncluded<PatreonMembership>(PatreonMembership).first()
-        val tierObj = hook.getIncluded<PatreonTier>(PatreonTier).maxByOrNull { it.attributes.amountCents ?: Int.MIN_VALUE }
-
-        transaction {
-            modelPostgresOperation()
-            Patreon.upsert(Patreon.id) {
-                it[id] = user.id.toInt()
-                it[pledge] = membership.attributes.currentlyEntitledAmountCents
-                it[active] = membership.attributes.patronStatus == PatreonStatus.ACTIVE
-                it[expireAt] = membership.attributes.nextChargeDate?.toJavaInstant()
-                it[tier] = tierObj?.id?.toIntOrNull()
+            transaction {
+                modelPostgresOperation()
+                PatreonLog.insert {
+                    it[type] = event ?: ""
+                    it[text] = hookContent
+                    it[time] = NowExpression(time)
+                }
             }
-        }
 
-        call.respond(HttpStatusCode.OK)
+            val hook = json.decodeFromString<PatreonResponse>(hookContent)
+            val user = hook.getIncluded<PatreonUser>(PatreonUser).first()
+            val membership = hook.getIncluded<PatreonMembership>(PatreonMembership).first()
+            val tierObj = hook.getIncluded<PatreonTier>(PatreonTier).maxByOrNull { it.attributes.amountCents ?: Int.MIN_VALUE }
+
+            transaction {
+                modelPostgresOperation()
+                Patreon.upsert(Patreon.id) {
+                    it[id] = user.id.toInt()
+                    it[pledge] = membership.attributes.currentlyEntitledAmountCents
+                    it[active] = membership.attributes.patronStatus == PatreonStatus.ACTIVE
+                    it[expireAt] = membership.attributes.nextChargeDate?.toJavaInstant()
+                    it[tier] = tierObj?.id?.toIntOrNull()
+                }
+            }
+
+            call.respond(HttpStatusCode.OK)
+        }
     }
 }

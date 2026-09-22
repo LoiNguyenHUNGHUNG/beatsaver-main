@@ -56,6 +56,7 @@ import io.beatmaps.common.util.LenientInstantSerializer
 import io.beatmaps.common.util.applyToQuery
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelSolrOperation
@@ -67,6 +68,8 @@ import io.ktor.server.request.userAgent
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondRedirect
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Instant
 import kotlinx.datetime.toJavaInstant
 import kotlinx.serialization.UseSerializers
@@ -82,6 +85,9 @@ import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransacti
 import java.util.logging.Logger
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.measureTime
+
+private val searchApiSolrGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val searchApiTextGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 private val searchThreshold = (System.getenv("SEARCH_THRESHOLD")?.toIntOrNull() ?: 10).seconds
 private val searchLogger = Logger.getLogger("bmio.Search")
@@ -293,161 +299,120 @@ fun Route.searchRoute() {
     }
 
     getWithOptions<SearchApi.Solr>("Search for maps with solr".responds(ok<SearchResponse>())) {
-        optionalAuthorization(OauthScope.SEARCH) { _, user ->
-            val searchInfo = SolrSearchParams.parseSearchQuery(it.q)
-            val actualSortOrder = searchInfo.validateSearchOrder(it.order.or(it.sortOrder.or(SearchOrder.Relevance)))
+        searchApiSolrGetSlots.withPermit {
+            optionalAuthorization(OauthScope.SEARCH) { _, user ->
+                val searchInfo = SolrSearchParams.parseSearchQuery(it.q)
+                val actualSortOrder = searchInfo.validateSearchOrder(it.order.or(it.sortOrder.or(SearchOrder.Relevance)))
 
-            newSuspendedTransaction {
-                modelPostgresOperation()
-                if (searchInfo.checkKeySearch(call)) return@newSuspendedTransaction
+                newSuspendedTransaction {
+                    modelPostgresOperation()
+                    if (searchInfo.checkKeySearch(call)) return@newSuspendedTransaction
 
-                val followingSubQuery = if (user != null && it.followed == true) {
-                    Follows
-                        .select(Follows.userId)
-                        .where { Follows.followerId eq user.userId and Follows.following }
-                        .map { it[Follows.userId].value }
-                } else {
-                    listOf()
-                }
-
-                val results = BsSolr.newQuery(actualSortOrder)
-                    .let { q ->
-                        searchInfo.applyQuery(q)
+                    val followingSubQuery = if (user != null && it.followed == true) {
+                        Follows
+                            .select(Follows.userId)
+                            .where { Follows.followerId eq user.userId and Follows.following }
+                            .map { it[Follows.userId].value }
+                    } else {
+                        listOf()
                     }
-                    .apply(
-                        when (it.automapper) {
-                            true -> null
-                            false -> BsSolr.ai eq true
-                            null -> BsSolr.ai eq false
-                        }
-                    )
-                    .apply(
-                        it.leaderboard.or(RankedFilter.All).let { leaderboard ->
-                            listOfNotNull(
-                                if (leaderboard.blRanked) BsSolr.rankedbl eq true else null,
-                                if (leaderboard.ssRanked) BsSolr.rankedss eq true else null
-                            ).anyOf()
-                        }
-                    )
-                    .apply(BsSolr.nps.betweenNullableInc(it.minNps?.orNull(), it.maxNps?.orNull()))
-                    .apply(BsSolr.votes.betweenNullableInc(it.minVotes?.orNull(), it.maxVotes?.orNull()))
-                    .apply(BsSolr.upvotes.betweenNullableInc(it.minUpVotes?.orNull(), it.maxUpVotes?.orNull()))
-                    .apply(BsSolr.downvotes.betweenNullableInc(it.minDownVotes?.orNull(), it.maxDownVotes?.orNull()))
-                    .apply(BsSolr.blStars.betweenNullableInc(it.minBlStars?.orNull(), it.maxBlStars?.orNull()))
-                    .apply(BsSolr.ssStars.betweenNullableInc(it.minSsStars?.orNull(), it.maxSsStars?.orNull()))
-                    .also { q ->
-                        it.environments?.let { env ->
-                            env.split(",")
-                                .mapNotNull { e -> EBeatsaberEnvironment.fromString(e)?.name }
-                                .let {
-                                    q.apply(BsSolr.environment inList it)
-                                }
-                        }
 
-                        it.characteristics?.let { char ->
-                            char.split(",")
-                                .mapNotNull { c -> ECharacteristic.fromNameOrNull(c)?.human() }
-                                .let {
-                                    q.apply(BsSolr.characteristics inList it)
-                                }
+                    val results = BsSolr.newQuery(actualSortOrder)
+                        .let { q ->
+                            searchInfo.applyQuery(q)
                         }
-                    }
-                    .notNull(it.ranked) { o -> (BsSolr.rankedbl eq o) or (BsSolr.rankedss eq o) }
-                    .let { q ->
-                        val tq = it.tags?.toQuery()
-                        val emptyTags = tq?.any { a ->
-                            a.any { b ->
-                                b.second == MapTag.None
+                        .apply(
+                            when (it.automapper) {
+                                true -> null
+                                false -> BsSolr.ai eq true
+                                null -> BsSolr.ai eq false
                             }
-                        } == true
-
-                        if (emptyTags) {
-                            searchLogger.warning("Query contained empty tag (${it.tags}) [${call.request.origin.remoteAddress}] (${call.request.userAgent()})")
-                        }
-
-                        tq?.applyToQuery(q) ?: q
-                    }
-                    .notNull(it.curated) { o -> BsSolr.curated.any().let { if (o) it else it.not() } }
-                    .notNull(it.verified) { o -> BsSolr.verified eq o }
-                    .notNull(it.fullSpread) { o -> BsSolr.fullSpread eq o }
-                    .notNullOpt(it.minRating) { o -> BsSolr.voteScore greaterEq o }
-                    .notNullOpt(it.maxRating) { o -> BsSolr.voteScore lessEq o }
-                    .notNullOpt(it.mapper) { o -> BsSolr.mapperId eq o }
-                    .notNull(it.collaborator) { o -> BsSolr.mapperIds inList o.split(",").mapNotNull { it.toIntOrNull() } }
-                    .notNullOpt(it.minBpm) { o -> BsSolr.bpm greaterEq o }
-                    .notNullOpt(it.maxBpm) { o -> BsSolr.bpm lessEq o }
-                    .notNullOpt(it.from) { o -> BsSolr.uploaded greaterEq o }
-                    .notNullOpt(it.to) { o -> BsSolr.uploaded lessEq o }
-                    .notNullOpt(it.minDuration) { o -> BsSolr.duration greaterEq o }
-                    .notNullOpt(it.maxDuration) { o -> BsSolr.duration lessEq o }
-                    .notNullOpt(it.curator) { o -> BsSolr.curatorId eq o }
-                    .also { q ->
-                        val mapperIds = followingSubQuery + (searchInfo.userSubQuery?.map { it[User.id].value } ?: listOf())
-                        q.apply(BsSolr.mapperIds inList mapperIds)
-                    }
-                    .also { q ->
-                        val mods = mapOf(
-                            it.chroma to { ModChecker.chroma() },
-                            it.noodle to { ModChecker.ne() },
-                            it.me to { ModChecker.me() },
-                            it.cinema to { ModChecker.cinema() },
-                            it.vivify to { ModChecker.vivify() }
                         )
-                        mods.forEach { (t, u) ->
-                            q.notNull(t) { o ->
-                                if (o) u() else u().not()
+                        .apply(
+                            it.leaderboard.or(RankedFilter.All).let { leaderboard ->
+                                listOfNotNull(
+                                    if (leaderboard.blRanked) BsSolr.rankedbl eq true else null,
+                                    if (leaderboard.ssRanked) BsSolr.rankedss eq true else null
+                                ).anyOf()
+                            }
+                        )
+                        .apply(BsSolr.nps.betweenNullableInc(it.minNps?.orNull(), it.maxNps?.orNull()))
+                        .apply(BsSolr.votes.betweenNullableInc(it.minVotes?.orNull(), it.maxVotes?.orNull()))
+                        .apply(BsSolr.upvotes.betweenNullableInc(it.minUpVotes?.orNull(), it.maxUpVotes?.orNull()))
+                        .apply(BsSolr.downvotes.betweenNullableInc(it.minDownVotes?.orNull(), it.maxDownVotes?.orNull()))
+                        .apply(BsSolr.blStars.betweenNullableInc(it.minBlStars?.orNull(), it.maxBlStars?.orNull()))
+                        .apply(BsSolr.ssStars.betweenNullableInc(it.minSsStars?.orNull(), it.maxSsStars?.orNull()))
+                        .also { q ->
+                            it.environments?.let { env ->
+                                env.split(",")
+                                    .mapNotNull { e -> EBeatsaberEnvironment.fromString(e)?.name }
+                                    .let {
+                                        q.apply(BsSolr.environment inList it)
+                                    }
+                            }
+
+                            it.characteristics?.let { char ->
+                                char.split(",")
+                                    .mapNotNull { c -> ECharacteristic.fromNameOrNull(c)?.human() }
+                                    .let {
+                                        q.apply(BsSolr.characteristics inList it)
+                                    }
                             }
                         }
-                    }
-                    .let { q ->
-                        BsSolr.addSortArgs(q, it.seed.hashCode(), actualSortOrder, it.ascending ?: false)
-                    }
-                    .paged(page = it.page.or(0).toInt(), pageSize = it.pageSize.or(20).coerceIn(1, 100))
-                    .also { modelSolrOperation() }
-                    .getIds(BsSolr, call = call)
+                        .notNull(it.ranked) { o -> (BsSolr.rankedbl eq o) or (BsSolr.rankedss eq o) }
+                        .let { q ->
+                            val tq = it.tags?.toQuery()
+                            val emptyTags = tq?.any { a ->
+                                a.any { b ->
+                                    b.second == MapTag.None
+                                }
+                            } == true
 
-                val beatmaps = Beatmap
-                    .joinVersions(true)
-                    .joinUploader()
-                    .joinCurator()
-                    .joinBookmarked(user?.userId)
-                    .joinCollaborators()
-                    .select(
-                        Beatmap.columns + Versions.columns + Difficulty.columns + User.columns +
-                            curatorAlias.columns + bookmark.columns + collaboratorAlias.columns
-                    )
-                    .where {
-                        Beatmap.id.inList(results.mapIds)
-                    }
-                    .complexToBeatmap()
-                    .sortedBy { results.order[it.id.value] } // Match order from solr
-                    .map { m -> MapDetail.from(m, cdnPrefix()) }
-                call.respond(SearchResponse(beatmaps, results.searchInfo))
-            }
-        }
-    }
+                            if (emptyTags) {
+                                searchLogger.warning("Query contained empty tag (${it.tags}) [${call.request.origin.remoteAddress}] (${call.request.userAgent()})")
+                            }
 
-    getWithOptions<SearchApi.Text>("Search for maps".responds(ok<SearchResponse>())) {
-        optionalAuthorization { _, user ->
-            val needsDiff = it.minNps != null || it.maxNps != null
-            val searchFields = Beatmap.name
-            val searchInfo = PgSearchParams.parseSearchQuery(it.q, searchFields)
-            val actualSortOrder = searchInfo.validateSearchOrder(it.order.or(it.sortOrder.or(SearchOrder.Relevance)))
-            val sortArgs = searchInfo.sortArgsFor(actualSortOrder)
+                            tq?.applyToQuery(q) ?: q
+                        }
+                        .notNull(it.curated) { o -> BsSolr.curated.any().let { if (o) it else it.not() } }
+                        .notNull(it.verified) { o -> BsSolr.verified eq o }
+                        .notNull(it.fullSpread) { o -> BsSolr.fullSpread eq o }
+                        .notNullOpt(it.minRating) { o -> BsSolr.voteScore greaterEq o }
+                        .notNullOpt(it.maxRating) { o -> BsSolr.voteScore lessEq o }
+                        .notNullOpt(it.mapper) { o -> BsSolr.mapperId eq o }
+                        .notNull(it.collaborator) { o -> BsSolr.mapperIds inList o.split(",").mapNotNull { it.toIntOrNull() } }
+                        .notNullOpt(it.minBpm) { o -> BsSolr.bpm greaterEq o }
+                        .notNullOpt(it.maxBpm) { o -> BsSolr.bpm lessEq o }
+                        .notNullOpt(it.from) { o -> BsSolr.uploaded greaterEq o }
+                        .notNullOpt(it.to) { o -> BsSolr.uploaded lessEq o }
+                        .notNullOpt(it.minDuration) { o -> BsSolr.duration greaterEq o }
+                        .notNullOpt(it.maxDuration) { o -> BsSolr.duration lessEq o }
+                        .notNullOpt(it.curator) { o -> BsSolr.curatorId eq o }
+                        .also { q ->
+                            val mapperIds = followingSubQuery + (searchInfo.userSubQuery?.map { it[User.id].value } ?: listOf())
+                            q.apply(BsSolr.mapperIds inList mapperIds)
+                        }
+                        .also { q ->
+                            val mods = mapOf(
+                                it.chroma to { ModChecker.chroma() },
+                                it.noodle to { ModChecker.ne() },
+                                it.me to { ModChecker.me() },
+                                it.cinema to { ModChecker.cinema() },
+                                it.vivify to { ModChecker.vivify() }
+                            )
+                            mods.forEach { (t, u) ->
+                                q.notNull(t) { o ->
+                                    if (o) u() else u().not()
+                                }
+                            }
+                        }
+                        .let { q ->
+                            BsSolr.addSortArgs(q, it.seed.hashCode(), actualSortOrder, it.ascending ?: false)
+                        }
+                        .paged(page = it.page.or(0).toInt(), pageSize = it.pageSize.or(20).coerceIn(1, 100))
+                        .also { modelSolrOperation() }
+                        .getIds(BsSolr, call = call)
 
-            newSuspendedTransaction {
-                modelPostgresOperation()
-                val followingSubQuery = if (user != null && it.followed == true) {
-                    Follows
-                        .select(Follows.userId)
-                        .where { Follows.followerId eq user.userId and Follows.following }
-                } else {
-                    null
-                }
-
-                if (searchInfo.checkKeySearch(call)) return@newSuspendedTransaction
-
-                val time = measureTime {
                     val beatmaps = Beatmap
                         .joinVersions(true)
                         .joinUploader()
@@ -459,72 +424,117 @@ fun Route.searchRoute() {
                                 curatorAlias.columns + bookmark.columns + collaboratorAlias.columns
                         )
                         .where {
-                            Beatmap.id.inSubQuery(
-                                Beatmap
-                                    .joinUploader()
-                                    .crossJoin(
-                                        Versions
-                                            .let { q ->
-                                                if (needsDiff) q.join(Difficulty, JoinType.INNER, Versions.id, Difficulty.versionId) else q
-                                            }
-                                            .select(intLiteral(1))
-                                            .where {
-                                                EqOp(Versions.mapId, Beatmap.id) and (Versions.state eq EMapState.Published)
-                                                    .notNullOpt(it.minNps) { o -> (Difficulty.nps greaterEqF o) }
-                                                    .notNullOpt(it.maxNps) { o -> (Difficulty.nps lessEqF o) }
-                                            }
-                                            .limit(1)
-                                            .lateral().alias("diff")
-                                    )
-                                    .select(Beatmap.id)
-                                    .where {
-                                        Beatmap.deletedAt.isNull()
-                                            .let { q -> searchInfo.applyQuery(q) }
-                                            .let { q ->
-                                                // Doesn't quite make sense but we want to exclude beat sage by default
-                                                when (it.automapper) {
-                                                    true -> q
-                                                    false -> q.and(Beatmap.declaredAi neq AiDeclarationType.None)
-                                                    null -> q.and(Beatmap.declaredAi eq AiDeclarationType.None)
-                                                }
-                                            }
-                                            .notNull(searchInfo.userSubQuery) { o -> Beatmap.uploader inSubQuery o }
-                                            .notNull(followingSubQuery) { o -> Beatmap.uploader inSubQuery o }
-                                            .notNull(it.ranked) { o -> (Beatmap.ranked eq o) or (Beatmap.blRanked eq o) }
-                                            .notNullOpt(it.leaderboard) { o ->
-                                                Op.of(o == RankedFilter.All).run {
-                                                    if (o.blRanked) this or Beatmap.blRanked else this
-                                                }.run {
-                                                    if (o.ssRanked) this or Beatmap.ranked else this
-                                                }
-                                            }
-                                            .notNull(it.curated) { o -> with(Beatmap.curatedAt) { if (o) isNotNull() else isNull() } }
-                                            .notNull(it.verified) { o -> User.verifiedMapper eq o }
-                                            .notNullOpt(it.minNps) { o -> (Beatmap.maxNps greaterEqF o) }
-                                            .notNullOpt(it.maxNps) { o -> (Beatmap.minNps lessEqF o) }
-                                            .notNullOpt(it.minRating) { o -> Beatmap.score greaterEqF o }
-                                            .notNullOpt(it.maxRating) { o -> Beatmap.score lessEqF o }
-                                            .notNullOpt(it.from) { o -> Beatmap.uploaded greaterEq o.toJavaInstant() }
-                                            .notNullOpt(it.to) { o -> Beatmap.uploaded lessEq o.toJavaInstant() }
-                                            .notNull(it.tags) { o ->
-                                                o.toQuery()?.applyToQuery() ?: Op.TRUE
-                                            }
-                                            .notNullOpt(it.mapper.or(it.collaborator)) { o -> Beatmap.uploader eq o }
-                                            .notNullOpt(it.curator) { o -> Beatmap.curator eq o }
-                                    }
-                                    .orderBy(*sortArgs)
-                                    .limit(it.page.or(0))
-                            )
+                            Beatmap.id.inList(results.mapIds)
                         }
-                        .orderBy(*sortArgs)
                         .complexToBeatmap()
+                        .sortedBy { results.order[it.id.value] } // Match order from solr
                         .map { m -> MapDetail.from(m, cdnPrefix()) }
-
-                    call.respond(SearchResponse(beatmaps))
+                    call.respond(SearchResponse(beatmaps, results.searchInfo))
                 }
+            }
+        }
+    }
 
-                if (time > searchThreshold) {
-                    searchLogger.info("Search took longer than $searchThreshold ($time)\n$user\n$it")
+    getWithOptions<SearchApi.Text>("Search for maps".responds(ok<SearchResponse>())) {
+        searchApiTextGetSlots.withPermit {
+            optionalAuthorization { _, user ->
+                val needsDiff = it.minNps != null || it.maxNps != null
+                val searchFields = Beatmap.name
+                val searchInfo = PgSearchParams.parseSearchQuery(it.q, searchFields)
+                val actualSortOrder = searchInfo.validateSearchOrder(it.order.or(it.sortOrder.or(SearchOrder.Relevance)))
+                val sortArgs = searchInfo.sortArgsFor(actualSortOrder)
+
+                newSuspendedTransaction {
+                    modelPostgresOperation()
+                    val followingSubQuery = if (user != null && it.followed == true) {
+                        Follows
+                            .select(Follows.userId)
+                            .where { Follows.followerId eq user.userId and Follows.following }
+                    } else {
+                        null
+                    }
+
+                    if (searchInfo.checkKeySearch(call)) return@newSuspendedTransaction
+
+                    val time = measureTime {
+                        val beatmaps = Beatmap
+                            .joinVersions(true)
+                            .joinUploader()
+                            .joinCurator()
+                            .joinBookmarked(user?.userId)
+                            .joinCollaborators()
+                            .select(
+                                Beatmap.columns + Versions.columns + Difficulty.columns + User.columns +
+                                    curatorAlias.columns + bookmark.columns + collaboratorAlias.columns
+                            )
+                            .where {
+                                Beatmap.id.inSubQuery(
+                                    Beatmap
+                                        .joinUploader()
+                                        .crossJoin(
+                                            Versions
+                                                .let { q ->
+                                                    if (needsDiff) q.join(Difficulty, JoinType.INNER, Versions.id, Difficulty.versionId) else q
+                                                }
+                                                .select(intLiteral(1))
+                                                .where {
+                                                    EqOp(Versions.mapId, Beatmap.id) and (Versions.state eq EMapState.Published)
+                                                        .notNullOpt(it.minNps) { o -> (Difficulty.nps greaterEqF o) }
+                                                        .notNullOpt(it.maxNps) { o -> (Difficulty.nps lessEqF o) }
+                                                }
+                                                .limit(1)
+                                                .lateral().alias("diff")
+                                        )
+                                        .select(Beatmap.id)
+                                        .where {
+                                            Beatmap.deletedAt.isNull()
+                                                .let { q -> searchInfo.applyQuery(q) }
+                                                .let { q ->
+                                                    // Doesn't quite make sense but we want to exclude beat sage by default
+                                                    when (it.automapper) {
+                                                        true -> q
+                                                        false -> q.and(Beatmap.declaredAi neq AiDeclarationType.None)
+                                                        null -> q.and(Beatmap.declaredAi eq AiDeclarationType.None)
+                                                    }
+                                                }
+                                                .notNull(searchInfo.userSubQuery) { o -> Beatmap.uploader inSubQuery o }
+                                                .notNull(followingSubQuery) { o -> Beatmap.uploader inSubQuery o }
+                                                .notNull(it.ranked) { o -> (Beatmap.ranked eq o) or (Beatmap.blRanked eq o) }
+                                                .notNullOpt(it.leaderboard) { o ->
+                                                    Op.of(o == RankedFilter.All).run {
+                                                        if (o.blRanked) this or Beatmap.blRanked else this
+                                                    }.run {
+                                                        if (o.ssRanked) this or Beatmap.ranked else this
+                                                    }
+                                                }
+                                                .notNull(it.curated) { o -> with(Beatmap.curatedAt) { if (o) isNotNull() else isNull() } }
+                                                .notNull(it.verified) { o -> User.verifiedMapper eq o }
+                                                .notNullOpt(it.minNps) { o -> (Beatmap.maxNps greaterEqF o) }
+                                                .notNullOpt(it.maxNps) { o -> (Beatmap.minNps lessEqF o) }
+                                                .notNullOpt(it.minRating) { o -> Beatmap.score greaterEqF o }
+                                                .notNullOpt(it.maxRating) { o -> Beatmap.score lessEqF o }
+                                                .notNullOpt(it.from) { o -> Beatmap.uploaded greaterEq o.toJavaInstant() }
+                                                .notNullOpt(it.to) { o -> Beatmap.uploaded lessEq o.toJavaInstant() }
+                                                .notNull(it.tags) { o ->
+                                                    o.toQuery()?.applyToQuery() ?: Op.TRUE
+                                                }
+                                                .notNullOpt(it.mapper.or(it.collaborator)) { o -> Beatmap.uploader eq o }
+                                                .notNullOpt(it.curator) { o -> Beatmap.curator eq o }
+                                        }
+                                        .orderBy(*sortArgs)
+                                        .limit(it.page.or(0))
+                                )
+                            }
+                            .orderBy(*sortArgs)
+                            .complexToBeatmap()
+                            .map { m -> MapDetail.from(m, cdnPrefix()) }
+
+                        call.respond(SearchResponse(beatmaps))
+                    }
+
+                    if (time > searchThreshold) {
+                        searchLogger.info("Search took longer than $searchThreshold ($time)\n$user\n$it")
+                    }
                 }
             }
         }

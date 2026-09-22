@@ -8,7 +8,7 @@ It is an experiment, not a production capacity recommendation.
 - `Application.beatmapsio` is the framework entry point.
 - Every Ktor HTTP handler is a long-lived callback: requests may invoke it an
   unbounded number of times and overlap.
-- Each handler that can perform an outbound download has its own semaphore with
+- Each handler that can perform a modeled network operation has its own semaphore with
   three permits. The gates are deliberately not shared between handlers, so the
   inferred application bound is the parallel composition of their individual
   bounds.
@@ -63,11 +63,12 @@ That is approximately 10.53 MB/s (84.3 Mb/s). It is a conservative peak-demand
 result: the effect representation raises all 79 possible concurrent downloads
 to the largest configured per-download rate (8 MB / 60 seconds).
 
-After adding the library-boundary effects, compilation intentionally stops on
-140 remaining checker diagnostics rather than silently assuming a bound:
+The library-boundary pass exposed 109 additional effectful HTTP handlers. Each
+now has its own immutable top-level three-permit semaphore, held for the entire
+handler body. This removes all HTTP-handler repetition diagnostics. Compilation
+still intentionally stops on 31 diagnostics rather than silently assuming a
+bound:
 
-- 109 HTTP handlers need a three-permit semaphore around the complete handler
-  body.
 - 16 effectful RabbitMQ consumer callbacks need a callback concurrency model;
   either a semaphore must be held until the callback finishes or the checker
   must trust and understand `prefetchCount`.

@@ -24,6 +24,7 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.common.util.returnFile
 import io.beatmaps.login.Session
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelRabbitMqOperation
 import io.ktor.resources.Resource
@@ -36,6 +37,8 @@ import io.ktor.server.routing.RoutingContext
 import io.ktor.server.sessions.get
 import io.ktor.server.sessions.sessions
 import io.ktor.util.hex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.serialization.UseSerializers
@@ -49,6 +52,10 @@ import java.io.File
 import java.util.Base64
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+
+private val cdnZipGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val cdnBeatSaverGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val cdnBSAudioGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 @Resource("/cdn")
 class CDN {
@@ -159,76 +166,80 @@ object CdnSig {
 
 fun Route.cdnRoute() {
     getWithOptions<CDN.Zip> {
-        val sess = call.sessions.get<Session>()
-        val signed = CdnSig.verify(it.file, call.request)
+        cdnZipGetSlots.withPermit {
+            val sess = call.sessions.get<Session>()
+            val signed = CdnSig.verify(it.file, call.request)
 
-        if (it.file.isBlank()) {
-            throw NotFoundException()
-        }
-
-        val file = File(Folders.localFolder(it.file, false), "${it.file}.zip")
-        val name = if (file.exists()) {
-            transaction {
-                modelPostgresOperation()
-                Beatmap
-                    .join(Versions, JoinType.INNER, onColumn = Beatmap.id, otherColumn = Versions.mapId)
-                    .selectAll()
-                    .where {
-                        val unsignedQuery = if (signed) {
-                            Op.TRUE
-                        } else {
-                            (Beatmap.uploader eq sess?.userId) or Versions.lastPublishedAt.isNotNull()
-                        }
-
-                        ((Versions.hash eq it.file) and Beatmap.deletedAt.isNull()) and unsignedQuery
-                    }
-                    .complexToBeatmap()
-                    .firstOrNull()
-                    ?.let { map ->
-                        map.versions.values.singleOrNull()?.let { version ->
-                            downloadFilename(Integer.toHexString(map.id.value), version.songName, version.levelAuthorName)
-                        }
-                    }
-            }?.also { _ ->
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "download.hash.${it.file}", null, DownloadInfo(it.file, DownloadType.HASH, call.request.origin.remoteHost))
+            if (it.file.isBlank()) {
+                throw NotFoundException()
             }
-        } else {
-            null
-        } ?: throw NotFoundException()
 
-        returnFile(file, name)
+            val file = File(Folders.localFolder(it.file, false), "${it.file}.zip")
+            val name = if (file.exists()) {
+                transaction {
+                    modelPostgresOperation()
+                    Beatmap
+                        .join(Versions, JoinType.INNER, onColumn = Beatmap.id, otherColumn = Versions.mapId)
+                        .selectAll()
+                        .where {
+                            val unsignedQuery = if (signed) {
+                                Op.TRUE
+                            } else {
+                                (Beatmap.uploader eq sess?.userId) or Versions.lastPublishedAt.isNotNull()
+                            }
+
+                            ((Versions.hash eq it.file) and Beatmap.deletedAt.isNull()) and unsignedQuery
+                        }
+                        .complexToBeatmap()
+                        .firstOrNull()
+                        ?.let { map ->
+                            map.versions.values.singleOrNull()?.let { version ->
+                                downloadFilename(Integer.toHexString(map.id.value), version.songName, version.levelAuthorName)
+                            }
+                        }
+                }?.also { _ ->
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "download.hash.${it.file}", null, DownloadInfo(it.file, DownloadType.HASH, call.request.origin.remoteHost))
+                }
+            } else {
+                null
+            } ?: throw NotFoundException()
+
+            returnFile(file, name)
+        }
     }
 
     getWithOptions<CDN.BeatSaver> {
-        val res = try {
-            transaction {
-                modelPostgresOperation()
-                Beatmap.joinVersions(false)
-                    .selectAll()
-                    .where {
-                        Beatmap.id eq it.file.toInt(16) and Beatmap.deletedAt.isNull()
-                    }.limit(1)
-                    .complexToBeatmap()
-                    .map { MapDetail.from(it, "") }
-                    .firstOrNull()?.let { map ->
-                        map.publishedVersion()?.let { version ->
-                            val file = File(Folders.localFolder(version.hash, false), "${version.hash}.zip")
+        cdnBeatSaverGetSlots.withPermit {
+            val res = try {
+                transaction {
+                    modelPostgresOperation()
+                    Beatmap.joinVersions(false)
+                        .selectAll()
+                        .where {
+                            Beatmap.id eq it.file.toInt(16) and Beatmap.deletedAt.isNull()
+                        }.limit(1)
+                        .complexToBeatmap()
+                        .map { MapDetail.from(it, "") }
+                        .firstOrNull()?.let { map ->
+                            map.publishedVersion()?.let { version ->
+                                val file = File(Folders.localFolder(version.hash, false), "${version.hash}.zip")
 
-                            if (file.exists()) {
-                                modelRabbitMqOperation()
-                                call.pub("beatmaps", "download.key.${it.file}", null, DownloadInfo(it.file, DownloadType.KEY, call.request.origin.remoteHost))
+                                if (file.exists()) {
+                                    modelRabbitMqOperation()
+                                    call.pub("beatmaps", "download.key.${it.file}", null, DownloadInfo(it.file, DownloadType.KEY, call.request.origin.remoteHost))
+                                }
+
+                                file to downloadFilename(map.id, map.metadata.songName, map.metadata.levelAuthorName)
                             }
-
-                            file to downloadFilename(map.id, map.metadata.songName, map.metadata.levelAuthorName)
                         }
-                    }
-            }
-        } catch (_: NumberFormatException) {
-            null
-        } ?: throw NotFoundException()
+                }
+            } catch (_: NumberFormatException) {
+                null
+            } ?: throw NotFoundException()
 
-        returnFile(res.first, res.second)
+            returnFile(res.first, res.second)
+        }
     }
 
     get<CDN.Audio> {
@@ -240,21 +251,23 @@ fun Route.cdnRoute() {
     }
 
     get<CDN.BSAudio> {
-        try {
-            transaction {
-                modelPostgresOperation()
-                VersionsDao.wrapRows(
-                    Beatmap.joinVersions(false).selectAll()
-                        .where {
-                            Beatmap.id eq it.file.toInt(16) and Beatmap.deletedAt.isNull()
-                        }.limit(1)
-                ).firstOrNull()?.hash
-            }
-        } catch (_: NumberFormatException) {
-            null
-        }?.let {
-            getAudio(it)
-        } ?: throw NotFoundException()
+        cdnBSAudioGetSlots.withPermit {
+            try {
+                transaction {
+                    modelPostgresOperation()
+                    VersionsDao.wrapRows(
+                        Beatmap.joinVersions(false).selectAll()
+                            .where {
+                                Beatmap.id eq it.file.toInt(16) and Beatmap.deletedAt.isNull()
+                            }.limit(1)
+                    ).firstOrNull()?.hash
+                }
+            } catch (_: NumberFormatException) {
+                null
+            }?.let {
+                getAudio(it)
+            } ?: throw NotFoundException()
+        }
     }
 
     getWithOptions<CDN.Cover> {

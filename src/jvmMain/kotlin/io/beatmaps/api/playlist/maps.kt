@@ -22,6 +22,7 @@ import io.beatmaps.common.dbo.PlaylistDao
 import io.beatmaps.common.dbo.PlaylistMap
 import io.beatmaps.common.dbo.Versions
 import io.beatmaps.common.dbo.joinVersions
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
@@ -30,6 +31,8 @@ import io.ktor.server.request.receive
 import io.ktor.server.resources.post
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jetbrains.exposed.exceptions.ExposedSQLException
 import org.jetbrains.exposed.sql.Expression
 import org.jetbrains.exposed.sql.SortOrder
@@ -43,6 +46,9 @@ import org.jetbrains.exposed.sql.intLiteral
 import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.postgresql.util.PSQLException
+
+private val playlistApiBatchPlaylistBatchRequestPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val playlistApiAddPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Route.playlistMaps() {
     class PlaylistChangeException(msg: String) : Exception(msg)
@@ -82,92 +88,94 @@ fun Route.playlistMaps() {
         "Add or remove up to 100 maps to a playlist. Requires OAUTH"
             .responds(ok<ActionResponse>(), notFound<ActionResponse>(), badRequest<ActionResponse>())
     ) { req, pbr ->
-        requireAuthorization(OauthScope.MANAGE_PLAYLISTS) { _, sess ->
-            val validKeys = (pbr.keys ?: listOf()).mapNotNull { key -> key.toIntOrNull(16) }
-            val hashesOrEmpty = pbr.hashes?.map { it.lowercase() } ?: listOf()
-            if (hashesOrEmpty.size + validKeys.size > 100) {
-                throw UserApiException("Too many maps")
-            } else if (hashesOrEmpty.size + validKeys.size <= 0 || (validKeys.size != (pbr.keys?.size ?: 0) && pbr.ignoreUnknown != true)) {
-                // No hashes or keys
-                // OR
-                // Some invalid keys but not allowed to ignore unknown
-                throw UserApiException("Nothing to do")
-            }
-
-            try {
-                transaction {
-                    modelPostgresOperation()
-                    Playlist
-                        .updateReturning(
-                            {
-                                (Playlist.id eq req.id?.orNull()) and (Playlist.owner eq sess.userId) and Playlist.deletedAt.isNull()
-                            },
-                            {
-                                it[songsChangedAt] = NowExpression(songsChangedAt)
-                            },
-                            *Playlist.columns.toTypedArray()
-                        )?.firstOrNull()?.let { row ->
-                            val playlist = PlaylistDao.wrapRow(row)
-                            val maxMap =
-                                PlaylistMap
-                                    .select(PlaylistMap.order)
-                                    .where {
-                                        PlaylistMap.playlistId eq playlist.id.value
-                                    }
-                                    .orderBy(PlaylistMap.order, SortOrder.DESC)
-                                    .limit(1)
-                                    .firstOrNull()
-                                    ?.let {
-                                        it[PlaylistMap.order]
-                                    } ?: 0f
-
-                            val lookup = Beatmap
-                                .joinVersions(false, state = null)
-                                .select(Versions.hash, Beatmap.id)
-                                .where {
-                                    Beatmap.deletedAt.isNull() and (Beatmap.id.inList(validKeys) or Versions.hash.inList(hashesOrEmpty))
-                                }.associate {
-                                    it[Versions.hash].lowercase() to it[Beatmap.id].value
-                                }
-                            val unorderedMapIds = lookup.values.toSet()
-
-                            val mapIds = validKeys.filter { unorderedMapIds.contains(it) } +
-                                hashesOrEmpty.mapNotNull { if (lookup.containsKey(it) && !validKeys.contains(lookup[it])) lookup[it] else null }
-
-                            val result = if (mapIds.size != (hashesOrEmpty + validKeys).size && pbr.ignoreUnknown != true) {
-                                rollback()
-                                null
-                            } else if (pbr.inPlaylist == true) {
-                                val info = PlaylistMap.batchInsert(mapIds.mapIndexed { idx, it -> idx to it }, true, shouldReturnGeneratedValues = false) {
-                                    this[PlaylistMap.playlistId] = playlist.id
-                                    this[PlaylistMap.mapId] = it.second
-                                    this[PlaylistMap.order] = maxMap + it.first + 1
-                                }
-
-                                // Will be equal to the row count regardless of if rows already existed or not
-                                info.size
-                            } else {
-                                PlaylistMap.deleteWhere {
-                                    (playlistId eq playlist.id.value) and (mapId.inList(mapIds))
-                                }
-                            }
-
-                            result?.let {
-                                if (it > 0) playlist.id.value else 0
-                            }
-                        }
+        playlistApiBatchPlaylistBatchRequestPostSlots.withPermit {
+            requireAuthorization(OauthScope.MANAGE_PLAYLISTS) { _, sess ->
+                val validKeys = (pbr.keys ?: listOf()).mapNotNull { key -> key.toIntOrNull(16) }
+                val hashesOrEmpty = pbr.hashes?.map { it.lowercase() } ?: listOf()
+                if (hashesOrEmpty.size + validKeys.size > 100) {
+                    throw UserApiException("Too many maps")
+                } else if (hashesOrEmpty.size + validKeys.size <= 0 || (validKeys.size != (pbr.keys?.size ?: 0) && pbr.ignoreUnknown != true)) {
+                    // No hashes or keys
+                    // OR
+                    // Some invalid keys but not allowed to ignore unknown
+                    throw UserApiException("Nothing to do")
                 }
-            } catch (_: PlaylistChangeException) {
-                null
-            }.let {
-                when (it) {
-                    null -> call.respond(HttpStatusCode.NotFound, ActionResponse.error("Playlist not found"))
-                    // I think this only occurs when deleting maps from playlist that aren't in the playlist
-                    0 -> call.respond(ActionResponse.success())
-                    else -> {
-                        modelRabbitMqOperation()
-                        call.pub("beatmaps", "playlists.$it.updated", null, it)
-                        call.respond(ActionResponse.success())
+
+                try {
+                    transaction {
+                        modelPostgresOperation()
+                        Playlist
+                            .updateReturning(
+                                {
+                                    (Playlist.id eq req.id?.orNull()) and (Playlist.owner eq sess.userId) and Playlist.deletedAt.isNull()
+                                },
+                                {
+                                    it[songsChangedAt] = NowExpression(songsChangedAt)
+                                },
+                                *Playlist.columns.toTypedArray()
+                            )?.firstOrNull()?.let { row ->
+                                val playlist = PlaylistDao.wrapRow(row)
+                                val maxMap =
+                                    PlaylistMap
+                                        .select(PlaylistMap.order)
+                                        .where {
+                                            PlaylistMap.playlistId eq playlist.id.value
+                                        }
+                                        .orderBy(PlaylistMap.order, SortOrder.DESC)
+                                        .limit(1)
+                                        .firstOrNull()
+                                        ?.let {
+                                            it[PlaylistMap.order]
+                                        } ?: 0f
+
+                                val lookup = Beatmap
+                                    .joinVersions(false, state = null)
+                                    .select(Versions.hash, Beatmap.id)
+                                    .where {
+                                        Beatmap.deletedAt.isNull() and (Beatmap.id.inList(validKeys) or Versions.hash.inList(hashesOrEmpty))
+                                    }.associate {
+                                        it[Versions.hash].lowercase() to it[Beatmap.id].value
+                                    }
+                                val unorderedMapIds = lookup.values.toSet()
+
+                                val mapIds = validKeys.filter { unorderedMapIds.contains(it) } +
+                                    hashesOrEmpty.mapNotNull { if (lookup.containsKey(it) && !validKeys.contains(lookup[it])) lookup[it] else null }
+
+                                val result = if (mapIds.size != (hashesOrEmpty + validKeys).size && pbr.ignoreUnknown != true) {
+                                    rollback()
+                                    null
+                                } else if (pbr.inPlaylist == true) {
+                                    val info = PlaylistMap.batchInsert(mapIds.mapIndexed { idx, it -> idx to it }, true, shouldReturnGeneratedValues = false) {
+                                        this[PlaylistMap.playlistId] = playlist.id
+                                        this[PlaylistMap.mapId] = it.second
+                                        this[PlaylistMap.order] = maxMap + it.first + 1
+                                    }
+
+                                    // Will be equal to the row count regardless of if rows already existed or not
+                                    info.size
+                                } else {
+                                    PlaylistMap.deleteWhere {
+                                        (playlistId eq playlist.id.value) and (mapId.inList(mapIds))
+                                    }
+                                }
+
+                                result?.let {
+                                    if (it > 0) playlist.id.value else 0
+                                }
+                            }
+                    }
+                } catch (_: PlaylistChangeException) {
+                    null
+                }.let {
+                    when (it) {
+                        null -> call.respond(HttpStatusCode.NotFound, ActionResponse.error("Playlist not found"))
+                        // I think this only occurs when deleting maps from playlist that aren't in the playlist
+                        0 -> call.respond(ActionResponse.success())
+                        else -> {
+                            modelRabbitMqOperation()
+                            call.pub("beatmaps", "playlists.$it.updated", null, it)
+                            call.respond(ActionResponse.success())
+                        }
                     }
                 }
             }
@@ -175,45 +183,47 @@ fun Route.playlistMaps() {
     }
 
     post<PlaylistApi.Add> { req ->
-        requireAuthorization(OauthScope.MANAGE_PLAYLISTS) { _, sess ->
-            val pmr = call.receive<PlaylistMapRequest>()
-            try {
-                transaction {
-                    modelPostgresOperation()
-                    Playlist
-                        .updateReturning(
-                            {
-                                (Playlist.id eq req.id?.orNull()) and (Playlist.owner eq sess.userId) and Playlist.deletedAt.isNull()
-                            },
-                            {
-                                it[songsChangedAt] = NowExpression(songsChangedAt)
-                            },
-                            *Playlist.columns.toTypedArray()
-                        )?.firstOrNull()?.let { row ->
-                            val playlist = PlaylistDao.wrapRow(row)
-                            val newOrder = pmr.order
+        playlistApiAddPostSlots.withPermit {
+            requireAuthorization(OauthScope.MANAGE_PLAYLISTS) { _, sess ->
+                val pmr = call.receive<PlaylistMapRequest>()
+                try {
+                    transaction {
+                        modelPostgresOperation()
+                        Playlist
+                            .updateReturning(
+                                {
+                                    (Playlist.id eq req.id?.orNull()) and (Playlist.owner eq sess.userId) and Playlist.deletedAt.isNull()
+                                },
+                                {
+                                    it[songsChangedAt] = NowExpression(songsChangedAt)
+                                },
+                                *Playlist.columns.toTypedArray()
+                            )?.firstOrNull()?.let { row ->
+                                val playlist = PlaylistDao.wrapRow(row)
+                                val newOrder = pmr.order
 
-                            // Only perform these operations once we've verified the owner is logged in
-                            // and the playlist exists (as above)
-                            if (applyPlaylistChange(playlist.id.value, pmr.inPlaylist == true, pmr.mapId.toInt(16), newOrder)) {
-                                playlist.id.value
-                            } else {
-                                0
+                                // Only perform these operations once we've verified the owner is logged in
+                                // and the playlist exists (as above)
+                                if (applyPlaylistChange(playlist.id.value, pmr.inPlaylist == true, pmr.mapId.toInt(16), newOrder)) {
+                                    playlist.id.value
+                                } else {
+                                    0
+                                }
                             }
+                    }
+                } catch (_: PlaylistChangeException) {
+                    null
+                } catch (_: NumberFormatException) {
+                    null
+                }.let {
+                    when (it) {
+                        null -> call.respond(HttpStatusCode.NotFound, ActionResponse.error("Playlist not found"))
+                        0 -> call.respond(ActionResponse.error())
+                        else -> {
+                            modelRabbitMqOperation()
+                            call.pub("beatmaps", "playlists.$it.updated", null, it)
+                            call.respond(ActionResponse.success())
                         }
-                }
-            } catch (_: PlaylistChangeException) {
-                null
-            } catch (_: NumberFormatException) {
-                null
-            }.let {
-                when (it) {
-                    null -> call.respond(HttpStatusCode.NotFound, ActionResponse.error("Playlist not found"))
-                    0 -> call.respond(ActionResponse.error())
-                    else -> {
-                        modelRabbitMqOperation()
-                        call.pub("beatmaps", "playlists.$it.updated", null, it)
-                        call.respond(ActionResponse.success())
                     }
                 }
             }

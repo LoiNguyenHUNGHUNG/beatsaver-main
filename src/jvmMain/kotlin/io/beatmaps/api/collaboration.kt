@@ -21,6 +21,7 @@ import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.common.dbo.Versions
 import io.beatmaps.common.dbo.collaboratorAlias
 import io.beatmaps.common.dbo.joinUploader
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.isUploader
 import io.beatmaps.util.modelPostgresOperation
@@ -34,6 +35,8 @@ import io.ktor.server.resources.get
 import io.ktor.server.resources.post
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.toKotlinInstant
 import kotlinx.serialization.UseSerializers
 import org.jetbrains.exposed.sql.JoinType
@@ -48,6 +51,11 @@ import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.vendors.ForUpdateOption
+
+private val collaborationApiCollaborationRequestPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val collaborationApiCollaborationResponsePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val collaborationApiCollaborationRemovePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val collaborationApiCollaborationsGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun CollaborationDetail.Companion.from(row: ResultRow, cdnPrefix: String) = CollaborationDao.wrapRow(row).let {
     CollaborationDetail(
@@ -90,157 +98,165 @@ class CollaborationApi {
 
 fun Route.collaborationRoute() {
     post<CollaborationApi.CollaborationRequest> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<CollaborationRequestData>()
+        collaborationApiCollaborationRequestPostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<CollaborationRequestData>()
 
-            val success = transaction {
-                modelPostgresOperation()
-                (isUploader(req.mapId, sess.userId) && !isSuspended(sess.userId, SuspensionType.Upload)).also { authorized ->
-                    if (authorized) {
-                        Collaboration.insertAndGetId {
-                            it[mapId] = req.mapId
-                            it[collaboratorId] = req.collaboratorId
-                            it[requestedAt] = NowExpression(requestedAt)
+                val success = transaction {
+                    modelPostgresOperation()
+                    (isUploader(req.mapId, sess.userId) && !isSuspended(sess.userId, SuspensionType.Upload)).also { authorized ->
+                        if (authorized) {
+                            Collaboration.insertAndGetId {
+                                it[mapId] = req.mapId
+                                it[collaboratorId] = req.collaboratorId
+                                it[requestedAt] = NowExpression(requestedAt)
+                            }
                         }
                     }
                 }
-            }
 
-            call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
+                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
+            }
         }
     }
 
     post<CollaborationApi.CollaborationResponse> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<CollaborationResponseData>()
+        collaborationApiCollaborationResponsePostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<CollaborationResponseData>()
 
-            // map is null when the collaboration has not been accepted
-            val (success, map) = transaction {
-                modelPostgresOperation()
-                if (req.accepted) {
-                    val (collab, map, published) = Collaboration
-                        .join(Beatmap, JoinType.LEFT, Collaboration.mapId, Beatmap.id) { Beatmap.deletedAt.isNull() }
-                        .join(Versions, JoinType.LEFT, onColumn = Beatmap.id, otherColumn = Versions.mapId, additionalConstraint = { Versions.state eq EMapState.Published })
-                        .joinUploader()
-                        .selectAll()
-                        .where {
-                            Collaboration.id eq req.collaborationId and (Collaboration.collaboratorId eq sess.userId)
+                // map is null when the collaboration has not been accepted
+                val (success, map) = transaction {
+                    modelPostgresOperation()
+                    if (req.accepted) {
+                        val (collab, map, published) = Collaboration
+                            .join(Beatmap, JoinType.LEFT, Collaboration.mapId, Beatmap.id) { Beatmap.deletedAt.isNull() }
+                            .join(Versions, JoinType.LEFT, onColumn = Beatmap.id, otherColumn = Versions.mapId, additionalConstraint = { Versions.state eq EMapState.Published })
+                            .joinUploader()
+                            .selectAll()
+                            .where {
+                                Collaboration.id eq req.collaborationId and (Collaboration.collaboratorId eq sess.userId)
+                            }
+                            .forUpdate(ForUpdateOption.PostgreSQL.ForUpdate(null, Collaboration))
+                            .singleOrNull()
+                            ?.let {
+                                UserDao.wrapRow(it)
+                                Triple(CollaborationDao.wrapRow(it), BeatmapDao.wrapRow(it), it.getOrNull(Versions.id) != null)
+                            } ?: Triple(null, null, null)
+
+                        if (collab?.accepted == true) {
+                            Pair(true, null)
+                        } else if (map != null && collab != null) {
+                            // Set to accepted
+                            Collaboration.update({
+                                Collaboration.id eq collab.id
+                            }) {
+                                it[accepted] = true
+                            }
+
+                            // Generate alert for followers of the collaborator, if the map has already been published.
+                            if (published == true) {
+                                val followsAlias = Follows.alias("f2")
+                                val recipients = Follows
+                                    .join(
+                                        followsAlias,
+                                        JoinType.LEFT,
+                                        followsAlias[Follows.followerId],
+                                        Follows.followerId
+                                    ) {
+                                        (followsAlias[Follows.userId] eq map.uploaderId) and followsAlias[Follows.following]
+                                    }
+                                    .select(Follows.followerId)
+                                    .where {
+                                        followsAlias[Follows.id].isNull() and (Follows.followerId neq map.uploaderId) and
+                                            (Follows.userId eq sess.userId) and Follows.collab and Follows.following
+                                    }
+                                    .map { row ->
+                                        row[Follows.followerId].value
+                                    }
+
+                                Alert.insert(
+                                    "New Map Collaboration",
+                                    "@${sess.uniqueName} collaborated with @${map.uploader.uniqueName} on #${
+                                        Integer.toHexString(
+                                            map.id.value
+                                        )
+                                    }: **${map.name}**.\n" +
+                                        "*\"${Alert.forDescription(map.description)}\"*",
+                                    EAlertType.MapRelease,
+                                    recipients
+                                )
+                                updateAlertCount(recipients)
+                            }
+                            Pair(true, map)
+                        } else {
+                            Pair(false, null)
                         }
-                        .forUpdate(ForUpdateOption.PostgreSQL.ForUpdate(null, Collaboration))
-                        .singleOrNull()
-                        ?.let {
-                            UserDao.wrapRow(it)
-                            Triple(CollaborationDao.wrapRow(it), BeatmapDao.wrapRow(it), it.getOrNull(Versions.id) != null)
-                        } ?: Triple(null, null, null)
-
-                    if (collab?.accepted == true) {
-                        Pair(true, null)
-                    } else if (map != null && collab != null) {
-                        // Set to accepted
-                        Collaboration.update({
-                            Collaboration.id eq collab.id
-                        }) {
-                            it[accepted] = true
-                        }
-
-                        // Generate alert for followers of the collaborator, if the map has already been published.
-                        if (published == true) {
-                            val followsAlias = Follows.alias("f2")
-                            val recipients = Follows
-                                .join(
-                                    followsAlias,
-                                    JoinType.LEFT,
-                                    followsAlias[Follows.followerId],
-                                    Follows.followerId
-                                ) {
-                                    (followsAlias[Follows.userId] eq map.uploaderId) and followsAlias[Follows.following]
-                                }
-                                .select(Follows.followerId)
-                                .where {
-                                    followsAlias[Follows.id].isNull() and (Follows.followerId neq map.uploaderId) and
-                                        (Follows.userId eq sess.userId) and Follows.collab and Follows.following
-                                }
-                                .map { row ->
-                                    row[Follows.followerId].value
-                                }
-
-                            Alert.insert(
-                                "New Map Collaboration",
-                                "@${sess.uniqueName} collaborated with @${map.uploader.uniqueName} on #${
-                                    Integer.toHexString(
-                                        map.id.value
-                                    )
-                                }: **${map.name}**.\n" +
-                                    "*\"${Alert.forDescription(map.description)}\"*",
-                                EAlertType.MapRelease,
-                                recipients
-                            )
-                            updateAlertCount(recipients)
-                        }
-                        Pair(true, map)
                     } else {
-                        Pair(false, null)
+                        val success = Collaboration.deleteWhere {
+                            id eq req.collaborationId and (collaboratorId eq sess.userId)
+                        } > 0
+
+                        Pair(success, null)
                     }
-                } else {
-                    val success = Collaboration.deleteWhere {
-                        id eq req.collaborationId and (collaboratorId eq sess.userId)
-                    } > 0
-
-                    Pair(success, null)
                 }
-            }
 
-            if (success && map != null) {
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "maps.${map.id}.updated.collaborators", null, map.id.value)
+                if (success && map != null) {
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "maps.${map.id}.updated.collaborators", null, map.id.value)
+                }
+                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
             }
-            call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
         }
     }
 
     post<CollaborationApi.CollaborationRemove> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<CollaborationRemoveData>()
+        collaborationApiCollaborationRemovePostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<CollaborationRemoveData>()
 
-            val success = transaction {
-                modelPostgresOperation()
-                (isUploader(req.mapId, sess.userId) || sess.userId == req.collaboratorId || sess.isAdmin()) &&
-                    Collaboration.deleteWhere {
-                        mapId eq req.mapId and (collaboratorId eq req.collaboratorId)
-                    } > 0
+                val success = transaction {
+                    modelPostgresOperation()
+                    (isUploader(req.mapId, sess.userId) || sess.userId == req.collaboratorId || sess.isAdmin()) &&
+                        Collaboration.deleteWhere {
+                            mapId eq req.mapId and (collaboratorId eq req.collaboratorId)
+                        } > 0
+                }
+
+                if (success) {
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "maps.${req.mapId}.updated.collaborators", null, req.mapId)
+                }
+
+                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
             }
-
-            if (success) {
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "maps.${req.mapId}.updated.collaborators", null, req.mapId)
-            }
-
-            call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
         }
     }
 
     get<CollaborationApi.Collaborations> {
-        requireAuthorization { _, sess ->
-            val mapId = it.id.toInt(16)
+        collaborationApiCollaborationsGetSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val mapId = it.id.toInt(16)
 
-            val collaborations = transaction {
-                modelPostgresOperation()
-                if (isUploader(mapId, sess.userId) || sess.admin) {
-                    Collaboration
-                        .join(collaboratorAlias, JoinType.LEFT, Collaboration.collaboratorId, collaboratorAlias[User.id])
-                        .selectAll()
-                        .where {
-                            Collaboration.mapId eq mapId
-                        }
-                        .orderBy(Collaboration.accepted, SortOrder.DESC)
-                        .map { row ->
-                            CollaborationDetail.from(row, cdnPrefix())
-                        }
-                } else {
-                    null
+                val collaborations = transaction {
+                    modelPostgresOperation()
+                    if (isUploader(mapId, sess.userId) || sess.admin) {
+                        Collaboration
+                            .join(collaboratorAlias, JoinType.LEFT, Collaboration.collaboratorId, collaboratorAlias[User.id])
+                            .selectAll()
+                            .where {
+                                Collaboration.mapId eq mapId
+                            }
+                            .orderBy(Collaboration.accepted, SortOrder.DESC)
+                            .map { row ->
+                                CollaborationDetail.from(row, cdnPrefix())
+                            }
+                    } else {
+                        null
+                    }
                 }
+                call.respond(collaborations ?: HttpStatusCode.Unauthorized)
             }
-            call.respond(collaborations ?: HttpStatusCode.Unauthorized)
         }
     }
 }

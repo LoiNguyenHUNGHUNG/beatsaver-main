@@ -67,6 +67,8 @@ import java.lang.Integer.toHexString
 import kotlin.math.log
 import kotlin.math.pow
 
+private val voteApiSinceGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 @Resource("/api")
 class VoteApi {
     @Group("Vote")
@@ -196,28 +198,30 @@ fun Route.voteRoute(client: HttpClient) {
     }
 
     getWithOptions<VoteApi.Since>("Get votes".responds(ok<List<VoteSummary>>(), notFound())) { req ->
-        val voteSummary = transaction {
-            modelPostgresOperation()
-            val updatedMaps =
-                Beatmap.joinVersions(false).selectAll().where {
-                    Beatmap.lastVoteAt greaterEq (req.since.or(Clock.System.now())).toJavaInstant()
-                }.complexToBeatmap()
+        voteApiSinceGetSlots.withPermit {
+            val voteSummary = transaction {
+                modelPostgresOperation()
+                val updatedMaps =
+                    Beatmap.joinVersions(false).selectAll().where {
+                        Beatmap.lastVoteAt greaterEq (req.since.or(Clock.System.now())).toJavaInstant()
+                    }.complexToBeatmap()
 
-            updatedMaps.map {
-                val mapDetail = MapDetail.from(it, "")
+                updatedMaps.map {
+                    val mapDetail = MapDetail.from(it, "")
 
-                VoteSummary(
-                    mapDetail.publishedVersion()?.hash,
-                    it.id.value,
-                    toHexString(it.id.value),
-                    it.upVotesInt,
-                    it.downVotesInt,
-                    it.score.toDouble()
-                )
+                    VoteSummary(
+                        mapDetail.publishedVersion()?.hash,
+                        it.id.value,
+                        toHexString(it.id.value),
+                        it.upVotesInt,
+                        it.downVotesInt,
+                        it.score.toDouble()
+                    )
+                }
             }
-        }
 
-        call.respond(voteSummary)
+            call.respond(voteSummary)
+        }
     }
 
     val validator = GameTokenValidator(client)

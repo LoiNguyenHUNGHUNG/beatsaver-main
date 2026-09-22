@@ -98,6 +98,12 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import java.lang.Integer.toHexString
 
+private val issueApiIssuePostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val issueApiIssueDetailGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val issueApiIssueDetailPostSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val issueApiIssueCommentsPutSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val issueApiIssueListGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 @Resource("/api/issues")
 class IssueApi {
     @Resource("/list/{page?}")
@@ -392,245 +398,255 @@ private val issueCommentSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Route.issueRoute(client: HttpClient) {
     post<IssueApi.Issue> {
-        requireAuthorization { _, sess ->
-            val req = call.receive<IssueCreationRequest>()
+        issueApiIssuePostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val req = call.receive<IssueCreationRequest>()
 
-            val (res, issueId) = issueCreateSlots.withPermit {
-                requireCaptcha(
-                    client,
-                    req.captcha,
-                    {
-                        ActionResponse.success() to newSuspendedTransaction {
-                            modelPostgresOperation()
-                            if (isSuspended(sess.userId, SuspensionType.Upload)) {
-                                // User is suspended
-                                throw UserApiException("Suspended account")
-                            }
+                val (res, issueId) = issueCreateSlots.withPermit {
+                    requireCaptcha(
+                        client,
+                        req.captcha,
+                        {
+                            ActionResponse.success() to newSuspendedTransaction {
+                                modelPostgresOperation()
+                                if (isSuspended(sess.userId, SuspensionType.Upload)) {
+                                    // User is suspended
+                                    throw UserApiException("Suspended account")
+                                }
 
-                            Issue.insertAndGetId {
-                                it[creator] = sess.userId
-                                it[createdAt] = NowExpression(createdAt)
-                                it[updatedAt] = NowExpression(updatedAt)
-                                it[type] = req.type
-                                it[data] = createDbIssue(req.type, req.id)
-                            }.also { newId ->
-                                IssueComment.insert {
-                                    it[issueId] = newId
-                                    it[text] = req.text.take(IssueConstants.MAX_COMMENT_LENGTH)
-                                    it[userId] = sess.userId
-                                    it[public] = true
-
+                                Issue.insertAndGetId {
+                                    it[creator] = sess.userId
                                     it[createdAt] = NowExpression(createdAt)
                                     it[updatedAt] = NowExpression(updatedAt)
+                                    it[type] = req.type
+                                    it[data] = createDbIssue(req.type, req.id)
+                                }.also { newId ->
+                                    IssueComment.insert {
+                                        it[issueId] = newId
+                                        it[text] = req.text.take(IssueConstants.MAX_COMMENT_LENGTH)
+                                        it[userId] = sess.userId
+                                        it[public] = true
+
+                                        it[createdAt] = NowExpression(createdAt)
+                                        it[updatedAt] = NowExpression(updatedAt)
+                                    }
+                                }.value.also {
+                                    Alert.insert(
+                                        "You created an issue",
+                                        "You created a ${req.type.name} issue {$it}",
+                                        EAlertType.Issue,
+                                        sess.userId
+                                    )
+                                    updateAlertCount(sess.userId)
                                 }
-                            }.value.also {
-                                Alert.insert(
-                                    "You created an issue",
-                                    "You created a ${req.type.name} issue {$it}",
-                                    EAlertType.Issue,
-                                    sess.userId
-                                )
-                                updateAlertCount(sess.userId)
                             }
                         }
+                    ) {
+                        it.toActionResponse() to null
                     }
-                ) {
-                    it.toActionResponse() to null
                 }
-            }
 
-            if (issueId != null) {
-                modelRabbitMqOperation()
-                call.pub("beatmaps", "issues.$issueId.created", null, issueId)
-                call.respond(HttpStatusCode.Created, issueId)
-            } else {
-                call.respond(HttpStatusCode.BadRequest, res)
+                if (issueId != null) {
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "issues.$issueId.created", null, issueId)
+                    call.respond(HttpStatusCode.Created, issueId)
+                } else {
+                    call.respond(HttpStatusCode.BadRequest, res)
+                }
             }
         }
     }
 
     get<IssueApi.IssueDetail> {
-        optionalAuthorization { _, sess ->
-            val issue = transaction {
-                modelPostgresOperation()
-                val issue = Issue
-                    .joinUser(Issue.creator)
-                    .selectAll()
-                    .where {
-                        (Issue.id eq it.id?.orNull()).let { q ->
-                            if (sess?.isAdmin() == true) {
-                                q
-                            } else {
-                                val cond = Issue.creator eq sess?.userId
-
-                                if (sess?.isCurator() == true) {
-                                    q and ((Issue.type inList(EIssueType.curatorTypes)) or cond)
+        issueApiIssueDetailGetSlots.withPermit {
+            optionalAuthorization { _, sess ->
+                val issue = transaction {
+                    modelPostgresOperation()
+                    val issue = Issue
+                        .joinUser(Issue.creator)
+                        .selectAll()
+                        .where {
+                            (Issue.id eq it.id?.orNull()).let { q ->
+                                if (sess?.isAdmin() == true) {
+                                    q
                                 } else {
-                                    q and cond
+                                    val cond = Issue.creator eq sess?.userId
+
+                                    if (sess?.isCurator() == true) {
+                                        q and ((Issue.type inList(EIssueType.curatorTypes)) or cond)
+                                    } else {
+                                        q and cond
+                                    }
                                 }
                             }
                         }
-                    }
-                    .handleUser()
-                    .preHydrate(sess?.isAdmin() == true)
-                    .singleOrNull() ?: throw NotFoundException()
+                        .handleUser()
+                        .preHydrate(sess?.isAdmin() == true)
+                        .singleOrNull() ?: throw NotFoundException()
 
-                val comments = IssueComment
-                    .joinUser(IssueComment.userId)
-                    .selectAll()
-                    .where { (IssueComment.issueId eq it.id?.orNull()) and IssueComment.deletedAt.isNull() and (if (sess?.isAdmin() == true) Op.TRUE else IssueComment.public) }
-                    .orderBy(IssueComment.createdAt, SortOrder.ASC)
-                    .handleUser()
+                    val comments = IssueComment
+                        .joinUser(IssueComment.userId)
+                        .selectAll()
+                        .where { (IssueComment.issueId eq it.id?.orNull()) and IssueComment.deletedAt.isNull() and (if (sess?.isAdmin() == true) Op.TRUE else IssueComment.public) }
+                        .orderBy(IssueComment.createdAt, SortOrder.ASC)
+                        .handleUser()
 
-                IssueDetail.from(issue, cdnPrefix(), comments)
+                    IssueDetail.from(issue, cdnPrefix(), comments)
+                }
+
+                call.respond(issue)
             }
-
-            call.respond(issue)
         }
     }
 
     post<IssueApi.IssueDetail> { req ->
-        requireAuthorization { _, sess ->
-            if (!sess.isCurator()) return@requireAuthorization ActionResponse.error("Unauthorised")
+        issueApiIssueDetailPostSlots.withPermit {
+            requireAuthorization { _, sess ->
+                if (!sess.isCurator()) return@requireAuthorization ActionResponse.error("Unauthorised")
 
-            val issueUpdate = call.receive<IssueUpdateRequest>()
-            val success = transaction {
-                modelPostgresOperation()
-                Issue.update({
-                    (Issue.id eq req.id?.orNull()).let { q ->
-                        if (sess.isAdmin()) {
-                            q
-                        } else {
-                            q and (Issue.type inList(EIssueType.curatorTypes))
+                val issueUpdate = call.receive<IssueUpdateRequest>()
+                val success = transaction {
+                    modelPostgresOperation()
+                    Issue.update({
+                        (Issue.id eq req.id?.orNull()).let { q ->
+                            if (sess.isAdmin()) {
+                                q
+                            } else {
+                                q and (Issue.type inList(EIssueType.curatorTypes))
+                            }
                         }
-                    }
-                }) {
-                    if (issueUpdate.closed) {
-                        it[closedAt] = Coalesce(closedAt, NowExpression(closedAt))
-                    } else {
-                        it[closedAt] = null
-                    }
-                    it[updatedAt] = NowExpression(updatedAt)
-                } > 0
-            }
+                    }) {
+                        if (issueUpdate.closed) {
+                            it[closedAt] = Coalesce(closedAt, NowExpression(closedAt))
+                        } else {
+                            it[closedAt] = null
+                        }
+                        it[updatedAt] = NowExpression(updatedAt)
+                    } > 0
+                }
 
-            if (success) {
-                call.respond(ActionResponse.success())
-            } else {
-                call.respond(HttpStatusCode.NotFound, ActionResponse.error())
+                if (success) {
+                    call.respond(ActionResponse.success())
+                } else {
+                    call.respond(HttpStatusCode.NotFound, ActionResponse.error())
+                }
             }
         }
     }
 
     put<IssueApi.IssueComments> { req ->
-        requireAuthorization { _, sess ->
-            val comment = call.receive<IssueCommentRequest>()
+        issueApiIssueCommentsPutSlots.withPermit {
+            requireAuthorization { _, sess ->
+                val comment = call.receive<IssueCommentRequest>()
 
-            val response = newSuspendedTransaction {
-                modelPostgresOperation()
-                if (isSuspended(sess.userId, SuspensionType.Upload)) {
-                    // User is suspended
-                    throw UserApiException("Suspended account")
-                }
+                val response = newSuspendedTransaction {
+                    modelPostgresOperation()
+                    if (isSuspended(sess.userId, SuspensionType.Upload)) {
+                        // User is suspended
+                        throw UserApiException("Suspended account")
+                    }
 
-                val intermediaryResult = Issue
-                    .updateReturning(
-                        { Issue.id eq req.id?.orNull() and Issue.closedAt.isNull() },
-                        {
-                            it[updatedAt] = NowExpression(updatedAt)
-                        },
-                        Issue.id, Issue.creator, Issue.type
-                    )
-                    ?.singleOrNull()
-                    ?.let { IssueDao.wrapRow(it) }
-
-                if (intermediaryResult == null) {
-                    rollback()
-                    return@newSuspendedTransaction ActionResponse.error("Issue not found")
-                }
-
-                val userPrivileged = sess.isAdmin() || (sess.isCurator() && EIssueType.curatorTypes.contains(intermediaryResult.type))
-
-                val commentId = req.commentId?.orNull()
-                if (commentId == null) {
-                    issueCommentSlots.withPermit {
-                        requireCaptcha(
-                            client,
-                            comment.captcha,
+                    val intermediaryResult = Issue
+                        .updateReturning(
+                            { Issue.id eq req.id?.orNull() and Issue.closedAt.isNull() },
                             {
-                                if (!(userPrivileged || sess.userId == intermediaryResult.creatorId.value)) {
-                                    rollback()
-                                    return@requireCaptcha ActionResponse.error("Unauthorised")
-                                }
+                                it[updatedAt] = NowExpression(updatedAt)
+                            },
+                            Issue.id, Issue.creator, Issue.type
+                        )
+                        ?.singleOrNull()
+                        ?.let { IssueDao.wrapRow(it) }
 
-                                IssueComment
-                                    .insertAndGetId {
-                                        it[issueId] = req.id.or(0)
-                                        it[userId] = sess.userId
-                                        it[text] = comment.text?.take(IssueConstants.MAX_COMMENT_LENGTH) ?: ""
-                                        it[public] = if (!userPrivileged) { true } else { comment.public ?: false }
-                                        it[createdAt] = NowExpression(createdAt)
-                                        it[updatedAt] = NowExpression(updatedAt)
+                    if (intermediaryResult == null) {
+                        rollback()
+                        return@newSuspendedTransaction ActionResponse.error("Issue not found")
+                    }
+
+                    val userPrivileged = sess.isAdmin() || (sess.isCurator() && EIssueType.curatorTypes.contains(intermediaryResult.type))
+
+                    val commentId = req.commentId?.orNull()
+                    if (commentId == null) {
+                        issueCommentSlots.withPermit {
+                            requireCaptcha(
+                                client,
+                                comment.captcha,
+                                {
+                                    if (!(userPrivileged || sess.userId == intermediaryResult.creatorId.value)) {
+                                        rollback()
+                                        return@requireCaptcha ActionResponse.error("Unauthorised")
                                     }
 
-                                ActionResponse.success()
-                            }
-                        ) { it.toActionResponse() }
+                                    IssueComment
+                                        .insertAndGetId {
+                                            it[issueId] = req.id.or(0)
+                                            it[userId] = sess.userId
+                                            it[text] = comment.text?.take(IssueConstants.MAX_COMMENT_LENGTH) ?: ""
+                                            it[public] = if (!userPrivileged) { true } else { comment.public ?: false }
+                                            it[createdAt] = NowExpression(createdAt)
+                                            it[updatedAt] = NowExpression(updatedAt)
+                                        }
+
+                                    ActionResponse.success()
+                                }
+                            ) { it.toActionResponse() }
+                        }
+                    } else {
+                        val success = IssueComment
+                            .update({
+                                ((IssueComment.id eq commentId) and (IssueComment.issueId eq req.id.or(0))).let { q ->
+                                    if (userPrivileged) q else q.and(IssueComment.userId eq sess.userId)
+                                }
+                            }) {
+                                comment.text?.let { txt -> it[text] = txt.take(IssueConstants.MAX_COMMENT_LENGTH) }
+                                if (userPrivileged) comment.public?.let { p -> it[public] = p }
+                            } > 0
+
+                        if (success) ActionResponse.success() else ActionResponse.error()
                     }
-                } else {
-                    val success = IssueComment
-                        .update({
-                            ((IssueComment.id eq commentId) and (IssueComment.issueId eq req.id.or(0))).let { q ->
-                                if (userPrivileged) q else q.and(IssueComment.userId eq sess.userId)
-                            }
-                        }) {
-                            comment.text?.let { txt -> it[text] = txt.take(IssueConstants.MAX_COMMENT_LENGTH) }
-                            if (userPrivileged) comment.public?.let { p -> it[public] = p }
-                        } > 0
-
-                    if (success) ActionResponse.success() else ActionResponse.error()
                 }
-            }
 
-            call.respond(if (response.success) HttpStatusCode.OK else HttpStatusCode.NotFound, response)
+                call.respond(if (response.success) HttpStatusCode.OK else HttpStatusCode.NotFound, response)
+            }
         }
     }
 
     get<IssueApi.IssueList> { req ->
-        requireAuthorization { _, sess ->
-            if (!sess.isCurator()) {
-                call.respond(HttpStatusCode.Unauthorized)
-                return@requireAuthorization
-            }
+        issueApiIssueListGetSlots.withPermit {
+            requireAuthorization { _, sess ->
+                if (!sess.isCurator()) {
+                    call.respond(HttpStatusCode.Unauthorized)
+                    return@requireAuthorization
+                }
 
-            val admin = sess.isAdmin()
+                val admin = sess.isAdmin()
 
-            val ans = transaction {
-                modelPostgresOperation()
-                Issue
-                    .joinUser(Issue.creator)
-                    .selectAll()
-                    .where {
-                        Op.TRUE
-                            .let { q ->
-                                if (!admin) {
-                                    q and (Issue.type inList(EIssueType.curatorTypes))
-                                } else {
-                                    q
+                val ans = transaction {
+                    modelPostgresOperation()
+                    Issue
+                        .joinUser(Issue.creator)
+                        .selectAll()
+                        .where {
+                            Op.TRUE
+                                .let { q ->
+                                    if (!admin) {
+                                        q and (Issue.type inList(EIssueType.curatorTypes))
+                                    } else {
+                                        q
+                                    }
                                 }
-                            }
-                            .notNullOpt(req.type) { o -> Issue.type eq o }
-                            .notNull(req.open) { o -> Issue.closedAt.run { if (o) isNull() else isNotNull() } }
-                    }
-                    .orderBy(Issue.updatedAt, SortOrder.DESC)
-                    .limit(req.page.or(0), 30)
-                    .handleUser()
-                    .preHydrate(admin)
-                    .map {
-                        IssueDetail.from(it, cdnPrefix())
-                    }
+                                .notNullOpt(req.type) { o -> Issue.type eq o }
+                                .notNull(req.open) { o -> Issue.closedAt.run { if (o) isNull() else isNotNull() } }
+                        }
+                        .orderBy(Issue.updatedAt, SortOrder.DESC)
+                        .limit(req.page.or(0), 30)
+                        .handleUser()
+                        .preHydrate(admin)
+                        .map {
+                            IssueDetail.from(it, cdnPrefix())
+                        }
+                }
+                call.respond(ans)
             }
-            call.respond(ans)
         }
     }
 }
