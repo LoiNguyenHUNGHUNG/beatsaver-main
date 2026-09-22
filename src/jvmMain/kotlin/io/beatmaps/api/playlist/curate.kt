@@ -16,6 +16,8 @@ import io.beatmaps.common.dbo.handleUser
 import io.beatmaps.common.dbo.joinPlaylistCurator
 import io.beatmaps.common.dbo.joinUser
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.request.receive
@@ -35,6 +37,7 @@ fun Route.playlistCurate() {
                 val playlistUpdate = call.receive<CuratePlaylist>()
 
                 val result = transaction {
+                    modelPostgresOperation()
                     fun curatePlaylist() =
                         Playlist.update({
                             (Playlist.id eq playlistUpdate.id) and (if (playlistUpdate.curated) Playlist.curatedAt.isNull() else Playlist.curatedAt.isNotNull()) and Playlist.deletedAt.isNull()
@@ -75,6 +78,7 @@ fun Route.playlistCurate() {
                         }
                     }
                 }?.also {
+                    modelRabbitMqOperation()
                     call.pub("beatmaps", "playlists.${it.playlistId}.updated.curation", null, it.playlistId)
                 }
 

@@ -26,6 +26,8 @@ import io.beatmaps.login.Session
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.handleMultipart
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.client.HttpClient
 import io.ktor.server.resources.post
@@ -116,6 +118,7 @@ fun Route.playlistCreate(client: HttpClient) {
                 val data = multipart.get<PlaylistCreateMultipart>()
 
                 val toCreate = newSuspendedTransaction {
+                    modelPostgresOperation()
                     PlaylistBasic(
                         0,
                         "",
@@ -134,6 +137,7 @@ fun Route.playlistCreate(client: HttpClient) {
                 }
 
                 val newId = transaction {
+                    modelPostgresOperation()
                     Playlist.insertAndGetId {
                         it[name] = toCreate.name
                         it[description] = data.description?.take(PlaylistConstants.MAX_DESCRIPTION_LENGTH) ?: ""
@@ -147,6 +151,8 @@ fun Route.playlistCreate(client: HttpClient) {
                     val localFile = File(Folders.localPlaylistCoverFolder(s), "$newId.jpg")
                     Files.move(temp.toPath(), localFile.toPath())
                 }
+
+                modelRabbitMqOperation()
 
                 call.pub("beatmaps", "playlists.$newId.created", null, newId)
                 call.respond(UploadResponse(newId.toString()))
@@ -169,6 +175,7 @@ fun Route.playlistCreate(client: HttpClient) {
             }
 
             val beforePlaylist = newSuspendedTransaction {
+                modelPostgresOperation()
                 Playlist.selectAll().where(query).firstOrNull()?.let { PlaylistFull.from(it, cdnPrefix()) }
             } ?: throw UploadException("Playlist not found")
 
@@ -195,6 +202,7 @@ fun Route.playlistCreate(client: HttpClient) {
 
             val newDescription = data.description?.take(PlaylistConstants.MAX_DESCRIPTION_LENGTH) ?: ""
             val toCreate = newSuspendedTransaction {
+                modelPostgresOperation()
                 PlaylistBasic(
                     0, "",
                     data.name ?: "",
@@ -211,6 +219,7 @@ fun Route.playlistCreate(client: HttpClient) {
             }
 
             transaction {
+                modelPostgresOperation()
                 fun updatePlaylist() {
                     Playlist.update({
                         query
@@ -246,6 +255,8 @@ fun Route.playlistCreate(client: HttpClient) {
                     }
                 }
             }
+
+            modelRabbitMqOperation()
 
             call.pub("beatmaps", "playlists.${req.id}.updated.detail", null, req.id.or(0))
             call.respond(UploadResponse(req.id.toString()))

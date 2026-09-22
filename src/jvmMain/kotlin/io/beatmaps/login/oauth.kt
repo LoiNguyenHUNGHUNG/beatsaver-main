@@ -6,6 +6,7 @@ import io.beatmaps.common.Config
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.login.patreon.patreonProvider
+import io.beatmaps.util.modelPostgresOperation
 import io.ktor.client.HttpClient
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
@@ -50,6 +51,7 @@ fun Application.installOauth(httpClient: HttpClient) {
             }
             validate { credentials ->
                 transaction {
+                    modelPostgresOperation()
                     User.selectAll().where {
                         if (credentials.name.contains('@')) {
                             (User.email eq credentials.name) and User.discordId.isNull()

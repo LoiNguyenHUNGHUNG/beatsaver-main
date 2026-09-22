@@ -81,6 +81,10 @@ import io.beatmaps.login.server.DBTokenStore
 import io.beatmaps.util.IMAGE_REQUEST_TIMEOUT_MILLIS
 import io.beatmaps.util.IMAGE_RESPONSE_MAX_BYTES
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.modelMongoOperation
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
+import io.beatmaps.util.modelSolrOperation
 import io.beatmaps.util.optionalAuthorization
 import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.requireCaptcha
@@ -511,6 +515,7 @@ fun Route.userRoute(client: HttpClient) {
                 throw UserApiException("Username not valid")
             } else {
                 val success = transaction {
+                    modelPostgresOperation()
                     try {
                         User.update({ User.id eq sess.userId and (User.uniqueName.isNull() or User.renamedAt.lessEq(DateMinusDays(NowExpression(User.renamedAt), 1))) }) { u ->
                             u[uniqueName] = req.textContent
@@ -525,6 +530,7 @@ fun Route.userRoute(client: HttpClient) {
                 success || throw UserApiException("You can only set a new username once per day")
 
                 call.sessions.set(sess.copy(uniqueName = req.textContent))
+                modelRabbitMqOperation()
                 call.pub("beatmaps", "user.${sess.userId}.updated.name", null, sess.userId)
                 call.respond(ActionResponse.success())
             }
@@ -536,6 +542,7 @@ fun Route.userRoute(client: HttpClient) {
             val req = call.receive<AccountDetailReq>()
 
             val success = transaction {
+                modelPostgresOperation()
                 try {
                     User.update({ User.id eq sess.userId }) { u ->
                         u[description] = req.textContent.take(UserConstants.MAX_DESCRIPTION_LENGTH)
@@ -547,6 +554,7 @@ fun Route.userRoute(client: HttpClient) {
             }
 
             success || throw ServerApiException("Something went wrong")
+            modelRabbitMqOperation()
             call.pub("beatmaps", "user.${sess.userId}.updated.info", null, sess.userId)
             call.respond(ActionResponse.success())
         }
@@ -557,6 +565,7 @@ fun Route.userRoute(client: HttpClient) {
             val req = call.receive<BlurReq>()
 
             transaction {
+                modelPostgresOperation()
                 try {
                     User.update({ User.id eq sess.userId }) { u ->
                         u[blurnsfw] = req.blur
@@ -580,6 +589,7 @@ fun Route.userRoute(client: HttpClient) {
                 val req = call.receive<UserAdminRequest>()
                 if (UserAdminRequest.allowedUploadSizes.contains(req.maxUploadSize) && UserAdminRequest.allowedVivifySizes.contains(req.maxVivifySize)) {
                     transaction {
+                        modelPostgresOperation()
                         fun runUpdate() =
                             User.update({
                                 User.id eq req.userId
@@ -607,6 +617,8 @@ fun Route.userRoute(client: HttpClient) {
                         if (success) {
                             MongoClient.updateSessions(req.userId, Session::curator, req.curator)
 
+                            modelRabbitMqOperation()
+
                             call.pub("beatmaps", "user.${req.userId}.updated.admin", null, req.userId)
                             ActionResponse.success()
                         } else {
@@ -624,6 +636,7 @@ fun Route.userRoute(client: HttpClient) {
 
     suspend fun RoutingContext.createSuspension(modId: Int, userId: Int, type: SuspensionType, reason: String? = null, durationMinutes: Int? = null) =
         newSuspendedTransaction {
+            modelPostgresOperation()
             Suspensions.update({
                 (Suspensions.userId eq userId) and Suspensions.revokedAt.isNull() and (Suspensions.type eq type) and
                     (Suspensions.expireAt greater NowExpression(Suspensions.expireAt))
@@ -680,6 +693,7 @@ fun Route.userRoute(client: HttpClient) {
             } else {
                 val req = call.receive<UserSuspendRequest>()
                 newSuspendedTransaction {
+                    modelPostgresOperation()
                     createSuspension(sess.userId, req.userId, SuspensionType.Upload, req.reason, if (req.suspended) null else 0).also {
                         if (it.success && req.suspended) {
                             Playlist.update({
@@ -727,6 +741,7 @@ fun Route.userRoute(client: HttpClient) {
                             val bcrypt = String(Bcrypt.hash(req.password, 12))
 
                             val newUserId = transaction {
+                                modelPostgresOperation()
                                 try {
                                     User.insertAndGetId {
                                         it[name] = req.username
@@ -799,6 +814,7 @@ fun Route.userRoute(client: HttpClient) {
                 req.captcha,
                 {
                     transaction {
+                        modelPostgresOperation()
                         User.selectAll().where {
                             (User.email eq req.email) and User.password.isNotNull() and (User.active or User.verifyToken.isNotNull())
                         }.firstOrNull()?.let { UserDao.wrapRow(it) }
@@ -831,6 +847,7 @@ fun Route.userRoute(client: HttpClient) {
     get<UsersApi.Sessions> {
         requireAuthorization { _, sess ->
             val oauthSessions = transaction {
+                modelPostgresOperation()
                 RefreshTokenTable
                     .join(OauthClient, JoinType.INNER, RefreshTokenTable.clientId, OauthClient.clientId)
                     .selectAll()
@@ -851,6 +868,7 @@ fun Route.userRoute(client: HttpClient) {
 
             val sessionId = call.request.cookies[cookieName]
             val siteSessions = if (MongoClient.connected) {
+                modelMongoOperation()
                 MongoClient.sessions.find(MongoSession::session / Session::userId eq sess.userId)
                     .sort(descending(MongoSession::expireAt))
                     .map { row ->
@@ -877,6 +895,7 @@ fun Route.userRoute(client: HttpClient) {
                 ActionResponse.error("Not an admin or no reason given")
             } else {
                 transaction {
+                    modelPostgresOperation()
                     if (userId != sess.userId) {
                         ModLog.insert(
                             sess.userId,
@@ -891,6 +910,7 @@ fun Route.userRoute(client: HttpClient) {
                     }
 
                     if (req.site != false && MongoClient.connected) {
+                        modelMongoOperation()
                         MongoClient.sessions.deleteMany(
                             and(MongoSession::id ne sessionId, MongoSession::session / Session::userId eq userId)
                         )
@@ -917,6 +937,7 @@ fun Route.userRoute(client: HttpClient) {
                 ActionResponse.error("site property is required when deleting by id")
             } else {
                 transaction {
+                    modelPostgresOperation()
                     if (userId != sess.userId) {
                         ModLog.insert(
                             sess.userId,
@@ -934,6 +955,7 @@ fun Route.userRoute(client: HttpClient) {
                     } else if (id == call.request.cookies[cookieName]) {
                         ActionResponse.error("Can't revoke current session")
                     } else {
+                        modelMongoOperation()
                         MongoClient.sessions.deleteOne(
                             MongoSession::id eq id
                         )
@@ -956,6 +978,7 @@ fun Route.userRoute(client: HttpClient) {
                     req.captcha,
                     {
                         newSuspendedTransaction {
+                            modelPostgresOperation()
                             User.selectAll().where {
                                 (User.id eq sess.userId)
                             }.firstOrNull()?.let { UserDao.wrapRow(it) }
@@ -1023,6 +1046,7 @@ fun Route.userRoute(client: HttpClient) {
             val action = untrusted.body.get("action", String::class.java)
 
             newSuspendedTransaction {
+                modelPostgresOperation()
                 User.selectAll().where {
                     User.id eq userId
                 }.firstOrNull()?.let { UserDao.wrapRow(it) }?.let { user ->
@@ -1103,6 +1127,7 @@ fun Route.userRoute(client: HttpClient) {
 
                 untrusted.body.subject.toInt().let { userId ->
                     transaction {
+                        modelPostgresOperation()
                         User.selectAll().where {
                             User.id eq userId
                         }.firstOrNull()?.let { UserDao.wrapRow(it) }?.let { user ->
@@ -1146,7 +1171,10 @@ fun Route.userRoute(client: HttpClient) {
                             }.let { it to user.active }
                         } ?: (ActionResponse.error("User not found") to false)
                     }.let { (response, previousActive) ->
-                        if (response.success && !previousActive) call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                        if (response.success && !previousActive) {
+                            modelRabbitMqOperation()
+                            call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                        }
                         response
                     }
                 }
@@ -1180,6 +1208,7 @@ fun Route.userRoute(client: HttpClient) {
                     val bcrypt = String(Bcrypt.hash(newPassword, 12))
 
                     transaction {
+                        modelPostgresOperation()
                         User.selectAll().where {
                             User.id eq sess.userId
                         }.firstOrNull()?.let { r ->
@@ -1215,6 +1244,7 @@ fun Route.userRoute(client: HttpClient) {
             }
 
             transaction {
+                modelPostgresOperation()
                 val shouldAlert = Follows.selectAll().where { (Follows.userId eq req.userId) and (Follows.followerId eq user.userId) }.empty()
 
                 Follows.upsert(conflictIndex = Follows.link) { follow ->
@@ -1246,6 +1276,7 @@ fun Route.userRoute(client: HttpClient) {
 
     get<UsersApi.Find> {
         val user = transaction {
+            modelPostgresOperation()
             User.selectAll().where {
                 User.hash.eq(it.id) and User.active
             }.firstOrNull()?.let { row -> UserDetail.from(row) }
@@ -1260,6 +1291,7 @@ fun Route.userRoute(client: HttpClient) {
 
     get<UsersApi.List> { req ->
         val us = transaction {
+            modelPostgresOperation()
             val userAlias = User.select(User.upvotes, User.id, User.name, User.uniqueName, User.description, User.avatar, User.hash, User.discordId).where {
                 Op.TRUE and User.active
             }.orderBy(User.upvotes, SortOrder.DESC).limit(req.page.or(0)).alias("u")
@@ -1323,6 +1355,7 @@ fun Route.userRoute(client: HttpClient) {
     val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
     get<UsersApi.UserPlaylist> {
         val (maps, user) = transaction {
+            modelPostgresOperation()
             Beatmap.joinVersions()
                 .selectAll().where {
                     Beatmap.id.inSubQuery(
@@ -1375,6 +1408,7 @@ fun Route.userRoute(client: HttpClient) {
     }
 
     suspend fun statsForUser(user: UserDao) = newSuspendedTransaction {
+        modelPostgresOperation()
         val countField = Playlist.id.count().alias("plcnt")
         val playlistSubquery = Playlist
             .select(countField, Playlist.owner)
@@ -1449,6 +1483,7 @@ fun Route.userRoute(client: HttpClient) {
     get<UsersApi.Me> {
         requireAuthorization { _, sess ->
             val detail = newSuspendedTransaction {
+                modelPostgresOperation()
                 val user = userBy {
                     User.id eq sess.userId
                 }
@@ -1473,6 +1508,7 @@ fun Route.userRoute(client: HttpClient) {
     getWithOptions<MapsApi.UserId>("Get user info".responds(ok<UserDetail>(), notFound())) {
         optionalAuthorization(OauthScope.FOLLOW) { _, sess ->
             val userDetail = newSuspendedTransaction {
+                modelPostgresOperation()
                 val user = userBy {
                     (User.id eq it.id?.orNull()) and User.active
                 }
@@ -1496,6 +1532,7 @@ fun Route.userRoute(client: HttpClient) {
         val ids = it.ids.split(",").mapNotNull { id -> id.toIntOrNull() }.take(50)
 
         val userDetail = transaction {
+            modelPostgresOperation()
             User
                 .selectAll()
                 .where {
@@ -1512,6 +1549,7 @@ fun Route.userRoute(client: HttpClient) {
     getWithOptions<MapsApi.UserName>("Get user info by name".responds(ok<UserDetail>(), notFound())) {
         val showAllStanding = call.sessions.get<Session>()?.isAdmin() == true
         val userDetail = newSuspendedTransaction {
+            modelPostgresOperation()
             val user = userBy {
                 (User.uniqueName eq it.name) and User.active
             }
@@ -1523,6 +1561,7 @@ fun Route.userRoute(client: HttpClient) {
     }
 
     fun getFollowerData(page: Long, joinOn: Column<EntityID<Int>>, condition: SqlExpressionBuilder.() -> Op<Boolean>) = transaction {
+        modelPostgresOperation()
         val followsSubquery = Follows
             .select(joinOn, Follows.since)
             .where { condition() and Follows.following }
@@ -1570,6 +1609,7 @@ fun Route.userRoute(client: HttpClient) {
 
     fun legacySearch(q: String?) = UserSearchResponse(
         transaction {
+            modelPostgresOperation()
             User
                 .selectAll()
                 .where {
@@ -1592,6 +1632,7 @@ fun Route.userRoute(client: HttpClient) {
         val searchInfo = (req.q ?: "").let { query -> SolrSearchParams(query, query, listOf()) }
 
         newSuspendedTransaction {
+            modelPostgresOperation()
             val response = UserSolr.newQuery()
                 .let { q ->
                     searchInfo.applyQuery(q)
@@ -1611,7 +1652,10 @@ fun Route.userRoute(client: HttpClient) {
                     q.apply(UserSolr.lastUpload.betweenNullableInc(req.lastUploadAfter?.orNull(), req.lastUploadBefore?.orNull()))
                 }
                 .paged(req.page.or(0).toInt(), req.pageSize.or(20).coerceIn(1, 100))
-                .let { UserSolr.query(it) }
+                .let { query ->
+                    modelSolrOperation()
+                    UserSolr.query(query)
+                }
 
             val userIds = response.results.mapNotNull { it[UserSolr.id] }
             val statsLookup = response.results.associateBy { it[UserSolr.id] }
@@ -1651,6 +1695,7 @@ fun Route.userRoute(client: HttpClient) {
 
     getWithOptions<UsersApi.Curators> {
         val users = transaction {
+            modelPostgresOperation()
             User
                 .selectAll()
                 .where { User.curator eq Op.TRUE }

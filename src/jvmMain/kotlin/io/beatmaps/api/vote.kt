@@ -33,6 +33,9 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.util.GameTokenValidator
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
+import io.beatmaps.util.modelSolrOperation
 import io.ktor.client.HttpClient
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
@@ -104,6 +107,7 @@ fun Route.voteRoute(client: HttpClient) {
     application.rabbitOptional {
         consumeAck("vote", QueuedVote::class) { _, body ->
             transaction {
+                modelPostgresOperation()
                 Votes.upsert(conflictIndex = Index(listOf(Votes.mapId, Votes.userId, Votes.steam), true, "vote_unique")) {
                     it[mapId] = body.mapId
                     it[userId] = body.userId
@@ -138,6 +142,7 @@ fun Route.voteRoute(client: HttpClient) {
                     val mapDeleted = row[Beatmap.deletedAt] != null
                     if (!mapDeleted) {
                         try {
+                            modelSolrOperation()
                             BsSolr.insert {
                                 it[mapId] = toHexString(body.mapId)
                                 it.update(voteScore, scoreWeighted.toFloat())
@@ -151,23 +156,28 @@ fun Route.voteRoute(client: HttpClient) {
                     row[Beatmap.uploader].value
                 }
             }?.let { uploader ->
+                modelRabbitMqOperation()
                 publish("beatmaps", "user.stats.$uploader", null, uploader)
+                modelRabbitMqOperation()
                 publish("beatmaps", "voteupdate.${body.mapId}", null, body.mapId)
             }
         }
 
         consumeAck("maptouv", Int.serializer()) { _, mapId ->
             transaction {
+                modelPostgresOperation()
                 Beatmap.select(Beatmap.uploader).where {
                     Beatmap.id eq mapId
                 }.firstOrNull()?.let { it[Beatmap.uploader].value }
             }?.let {
+                modelRabbitMqOperation()
                 publish("beatmaps", "user.stats.$it", null, it)
             }
         }
 
         consumeAck("uvstats", Int.serializer()) { _, body ->
             transaction {
+                modelPostgresOperation()
                 val subQuery = Beatmap
                     .joinVersions()
                     .select(coalesce(Beatmap.upVotesInt.sum(), intLiteral(0)).alias("votes"))
@@ -187,6 +197,7 @@ fun Route.voteRoute(client: HttpClient) {
 
     getWithOptions<VoteApi.Since>("Get votes".responds(ok<List<VoteSummary>>(), notFound())) { req ->
         val voteSummary = transaction {
+            modelPostgresOperation()
             val updatedMaps =
                 Beatmap.joinVersions(false).selectAll().where {
                     Beatmap.lastVoteAt greaterEq (req.since.or(Clock.System.now())).toJavaInstant()
@@ -215,6 +226,7 @@ fun Route.voteRoute(client: HttpClient) {
 
         voteValidationSlots.withPermit {
             newSuspendedTransaction {
+                modelPostgresOperation()
                 try {
                     val mapIdRow = Versions.select(Versions.mapId).where {
                         Versions.hash eq req.hash.lowercase()
@@ -242,6 +254,7 @@ fun Route.voteRoute(client: HttpClient) {
                     } ?: error("No user identifier provided")
 
                     val mapId = mapIdRow[Versions.mapId]
+                    modelRabbitMqOperation()
                     call.pub("beatmaps", "vote.$mapId", null, QueuedVote(userId, steam, mapId.value, req.direction))
 
                     call.respond(ActionResponse.success())

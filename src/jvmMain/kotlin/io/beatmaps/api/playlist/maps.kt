@@ -22,6 +22,8 @@ import io.beatmaps.common.dbo.PlaylistDao
 import io.beatmaps.common.dbo.PlaylistMap
 import io.beatmaps.common.dbo.Versions
 import io.beatmaps.common.dbo.joinVersions
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.request.receive
@@ -94,6 +96,7 @@ fun Route.playlistMaps() {
 
             try {
                 transaction {
+                    modelPostgresOperation()
                     Playlist
                         .updateReturning(
                             {
@@ -162,6 +165,7 @@ fun Route.playlistMaps() {
                     // I think this only occurs when deleting maps from playlist that aren't in the playlist
                     0 -> call.respond(ActionResponse.success())
                     else -> {
+                        modelRabbitMqOperation()
                         call.pub("beatmaps", "playlists.$it.updated", null, it)
                         call.respond(ActionResponse.success())
                     }
@@ -175,6 +179,7 @@ fun Route.playlistMaps() {
             val pmr = call.receive<PlaylistMapRequest>()
             try {
                 transaction {
+                    modelPostgresOperation()
                     Playlist
                         .updateReturning(
                             {
@@ -206,6 +211,7 @@ fun Route.playlistMaps() {
                     null -> call.respond(HttpStatusCode.NotFound, ActionResponse.error("Playlist not found"))
                     0 -> call.respond(ActionResponse.error())
                     else -> {
+                        modelRabbitMqOperation()
                         call.pub("beatmaps", "playlists.$it.updated", null, it)
                         call.respond(ActionResponse.success())
                     }

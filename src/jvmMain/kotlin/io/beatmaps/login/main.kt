@@ -12,6 +12,8 @@ import io.beatmaps.genericPage
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
 import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.jsonwebtoken.JwtException
 import io.jsonwebtoken.Jwts
@@ -182,6 +184,7 @@ fun Route.authRoute(client: HttpClient) {
 
             trusted.body.subject.toInt().let { userId ->
                 transaction {
+                    modelPostgresOperation()
                     User.update({
                         (User.id eq userId) and User.verifyToken.isNotNull()
                     }) {
@@ -190,7 +193,10 @@ fun Route.authRoute(client: HttpClient) {
                         it[updatedAt] = NowExpression(updatedAt)
                     } > 0
                 }.also {
-                    if (it) call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                    if (it) {
+                        modelRabbitMqOperation()
+                        call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                    }
                 }
             }
         } catch (e: SignatureException) {
@@ -304,6 +310,7 @@ fun Route.authRoute(client: HttpClient) {
             val steamid = matches[1].toLong()
 
             transaction {
+                modelPostgresOperation()
                 User.update({ User.id eq sess.userId }) {
                     it[steamId] = steamid
                     it[updatedAt] = NowExpression(updatedAt)

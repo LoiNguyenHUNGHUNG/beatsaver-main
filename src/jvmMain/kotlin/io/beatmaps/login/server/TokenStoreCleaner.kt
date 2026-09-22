@@ -3,6 +3,7 @@ package io.beatmaps.login.server
 import io.beatmaps.common.db.NowExpression
 import io.beatmaps.common.dbo.AccessTokenTable
 import io.beatmaps.common.dbo.RefreshTokenTable
+import io.beatmaps.util.modelPostgresOperation
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.less
 import org.jetbrains.exposed.sql.deleteWhere
@@ -14,6 +15,7 @@ class TokenStoreCleaner : TimerTask() {
     override fun run() {
         try {
             transaction {
+                modelPostgresOperation()
                 AccessTokenTable.deleteWhere {
                     expiration less NowExpression(expiration)
                 }

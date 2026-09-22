@@ -2,6 +2,7 @@ package io.beatmaps.login
 
 import com.mongodb.client.MongoCollection
 import com.mongodb.client.model.ReplaceOptions
+import io.beatmaps.util.modelMongoOperation
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.install
@@ -58,14 +59,19 @@ object MongoClient {
 
     var connected = false
 
-    fun deleteSessionsFor(userId: Int) =
-        connected && sessions.deleteMany(MongoSession::session / Session::userId eq userId).wasAcknowledged()
+    fun deleteSessionsFor(userId: Int): Boolean {
+        if (!connected) return false
+
+        modelMongoOperation()
+        return sessions.deleteMany(MongoSession::session / Session::userId eq userId).wasAcknowledged()
+    }
 
     fun testConnection() =
         try {
             if (database == null) throw Exception("Mongo not configured")
 
             sessions = database.getCollection<MongoSession>("sessions")
+            modelMongoOperation()
             sessions.countDocuments(EMPTY_BSON)
             connected = true
 
@@ -76,6 +82,7 @@ object MongoClient {
 
     fun <T> updateSessions(userId: Int, property: KProperty1<Session, T>, value: T) {
         if (connected) {
+            modelMongoOperation()
             sessions.updateMany(
                 MongoSession::session / Session::userId eq userId,
                 setValue(MongoSession::session / property, value)
@@ -119,11 +126,15 @@ fun Application.installSessions() {
 }
 
 class MongoSessionStorage(private val collection: MongoCollection<MongoSession>) : TypedSessionStorage<Session> {
-    override suspend fun read(id: String) = collection.findOne(MongoSession::id eq id)?.session ?: throw NoSuchElementException()
+    override suspend fun read(id: String): Session {
+        modelMongoOperation()
+        return collection.findOne(MongoSession::id eq id)?.session ?: throw NoSuchElementException()
+    }
 
     override suspend fun write(id: String, value: Session) = writeLocal(id, value)
 
     private fun writeLocal(id: String, value: Session, ttl: Long = 7 * 24 * 3600L) {
+        modelMongoOperation()
         collection.replaceOne(
             MongoSession::id eq id,
             MongoSession(id, value, Clock.System.now().plus(ttl.seconds)),
@@ -132,6 +143,7 @@ class MongoSessionStorage(private val collection: MongoCollection<MongoSession>)
     }
 
     override suspend fun invalidate(id: String) {
+        modelMongoOperation()
         collection.deleteOne(
             MongoSession::id eq id
         )

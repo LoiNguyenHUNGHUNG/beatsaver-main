@@ -15,6 +15,7 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.genericPage
 import io.beatmaps.login.Session
+import io.beatmaps.util.modelPostgresOperation
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
 import io.ktor.server.resources.get
@@ -83,6 +84,7 @@ class AlertController
 fun Route.userController() {
     get<UploaderController.RedirectOld> {
         transaction {
+            modelPostgresOperation()
             User.selectAll().where {
                 User.hash eq it.key
             }.firstOrNull()?.let { UserDao.wrapRow(it) }
@@ -108,6 +110,7 @@ fun Route.userController() {
         } else {
             val userData = reqId?.let {
                 transaction {
+                    modelPostgresOperation()
                     User
                         .selectAll()
                         .where {
@@ -135,6 +138,7 @@ fun Route.userController() {
 
     get<UserController.RedirectName> {
         transaction {
+            modelPostgresOperation()
             User.selectAll().where {
                 (User.uniqueName eq it.name) and User.active
             }.firstOrNull()?.let { UserDao.wrapRow(it) }
@@ -149,6 +153,7 @@ fun Route.userController() {
         val sess = call.sessions.get<Session>()
         if (sess != null) {
             transaction {
+                modelPostgresOperation()
                 User.update({ User.id eq sess.userId }) {
                     it[discordId] = null
                     it[updatedAt] = NowExpression(updatedAt)
@@ -164,6 +169,7 @@ fun Route.userController() {
         val sess = call.sessions.get<Session>()
         if (sess != null) {
             transaction {
+                modelPostgresOperation()
                 User.update({ User.id eq sess.userId }) {
                     it[patreonId] = null
                     it[updatedAt] = NowExpression(updatedAt)

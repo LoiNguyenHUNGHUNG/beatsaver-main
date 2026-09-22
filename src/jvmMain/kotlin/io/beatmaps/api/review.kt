@@ -45,6 +45,8 @@ import io.beatmaps.common.util.requireParams
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.captchaIfPresent
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.requireCaptcha
 import io.beatmaps.util.updateAlertCount
@@ -269,6 +271,7 @@ private val replyUpdateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 fun Route.reviewRoute(client: HttpClient) {
     get<ReviewApi.ByDate> {
         val reviews = transaction {
+            modelPostgresOperation()
             try {
                 Review
                     .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
@@ -302,6 +305,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
     get<ReviewApi.Detail> {
         val review = transaction {
+            modelPostgresOperation()
             try {
                 Review
                     .joinReplies()
@@ -331,6 +335,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
     get<ReviewApi.ByMap> {
         val reviews = transaction {
+            modelPostgresOperation()
             try {
                 Review
                     .joinReplies()
@@ -377,6 +382,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
     get<ReviewApi.ByUser> {
         val reviews = transaction {
+            modelPostgresOperation()
             try {
                 Review
                     .joinReplies()
@@ -420,6 +426,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
     get<ReviewApi.Single> {
         val review = transaction {
+            modelPostgresOperation()
             try {
                 Review
                     .joinReplies()
@@ -462,6 +469,7 @@ fun Route.reviewRoute(client: HttpClient) {
             reviewUpdateSlots.withPermit {
                 captchaIfPresent(client, update.captcha) {
                     val success = newSuspendedTransaction {
+                        modelPostgresOperation()
                         if (reqUid != sess.userId && !sess.isCurator()) {
                             call.respond(HttpStatusCode.Forbidden, ActionResponse.error())
                             return@newSuspendedTransaction false
@@ -554,6 +562,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
                     if (success) {
                         val updateType = if (update.captcha == null) "updated" else "created"
+                        modelRabbitMqOperation()
                         call.pub("beatmaps", "reviews.$updateMapId.$updateType", null, ReviewUpdateInfo(updateMapId, reqUid))
                         call.respond(ActionResponse.success())
                     }
@@ -574,6 +583,7 @@ fun Route.reviewRoute(client: HttpClient) {
             }
 
             transaction {
+                modelPostgresOperation()
                 val result = Review.updateReturning({ Review.mapId eq mapId and (Review.userId eq reqUid) and Review.deletedAt.isNull() }, { r ->
                     r[deletedAt] = NowExpression(deletedAt)
                 }, Review.id, Review.text, Review.sentiment)
@@ -605,6 +615,8 @@ fun Route.reviewRoute(client: HttpClient) {
                 }
             }
 
+            modelRabbitMqOperation()
+
             call.pub("beatmaps", "reviews.$mapId.deleted", null, ReviewUpdateInfo(mapId, reqUid))
             call.respond(HttpStatusCode.OK)
         }
@@ -618,6 +630,7 @@ fun Route.reviewRoute(client: HttpClient) {
                 val reviewUpdate = call.receive<CurateReview>()
 
                 transaction {
+                    modelPostgresOperation()
                     fun curateReview() =
                         Review.updateReturning({
                             (Review.id eq reviewUpdate.id) and (if (reviewUpdate.curated) Review.curatedAt.isNull() else Review.curatedAt.isNotNull()) and Review.deletedAt.isNull()
@@ -633,6 +646,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
                     curateReview()
                 }?.let {
+                    modelRabbitMqOperation()
                     call.pub("beatmaps", "reviews.${it.mapId}.curated", null, it)
                 }
 
@@ -654,6 +668,7 @@ fun Route.reviewRoute(client: HttpClient) {
                     reply.captcha,
                     {
                         val (insertedId, response) = newSuspendedTransaction {
+                            modelPostgresOperation()
                             if (isSuspended(user.userId, SuspensionType.Review)) throw UserApiException("You are currently silenced and cannot review maps or reply to reviews.")
 
                             val intermediaryResult = Review
@@ -738,6 +753,7 @@ fun Route.reviewRoute(client: HttpClient) {
                         }
 
                         if (insertedId != null) {
+                            modelRabbitMqOperation()
                             call.pub("beatmaps", "ws.review-replies.created", null, insertedId)
                         }
 
@@ -760,6 +776,7 @@ fun Route.reviewRoute(client: HttpClient) {
             replyUpdateSlots.withPermit {
                 captchaIfPresent(client, update.captcha) {
                     val response = newSuspendedTransaction {
+                        modelPostgresOperation()
                         if (isSuspended(user.userId, SuspensionType.Review)) throw UserApiException("You are currently silenced and cannot review maps or reply to reviews.")
 
                         val ownerId = ReviewReply
@@ -802,6 +819,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
                     // This should be outside the transaction - otherwise the websocket will send the old text
                     if (response.success) {
+                        modelRabbitMqOperation()
                         call.pub("beatmaps", "ws.review-replies.updated", null, replyId)
                     }
 
@@ -817,6 +835,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
         requireAuthorization { _, user ->
             val response = newSuspendedTransaction {
+                modelPostgresOperation()
                 val ownerId = ReviewReply
                     .select(ReviewReply.userId)
                     .where { ReviewReply.id eq replyId }
@@ -860,6 +879,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
                 // This can be inside the delete transaction since only the ID is needed and no data is retrieved
                 if (deleted != null) {
+                    modelRabbitMqOperation()
                     call.pub("beatmaps", "ws.review-replies.deleted", null, deleted[ReviewReply.id].value)
                     HttpStatusCode.OK
                 } else {
@@ -873,6 +893,7 @@ fun Route.reviewRoute(client: HttpClient) {
 
     get<ReplyApi.ByDate> {
         val replies = transaction {
+            modelPostgresOperation()
             try {
                 ReviewReply
                     .join(reviewerAlias, JoinType.INNER, ReviewReply.userId, reviewerAlias[User.id])

@@ -32,6 +32,7 @@ class BeatsageCleanse(private val app: Application) : TimerTask() {
     override fun run() {
         try {
             transaction {
+                modelPostgresOperation()
                 // This query is probably fairly slow but as we only run it once per minute (and could run it less often)
                 // it probably doesn't need optimisation
                 VersionsDao.wrapRows(
@@ -61,6 +62,7 @@ class BeatsageCleanse(private val app: Application) : TimerTask() {
             }
 
             transaction {
+                modelPostgresOperation()
                 val subQuery = Beatmap
                     .joinVersions {
                         Versions.sageScore less (-10).toShort()
@@ -90,6 +92,7 @@ class BeatsageCleanse(private val app: Application) : TimerTask() {
                     )
                 }
             }?.forEach {
+                modelRabbitMqOperation()
                 app.pub("beatmaps", "maps.$it.updated.deleted", null, it)
             }
         } catch (e: Exception) {

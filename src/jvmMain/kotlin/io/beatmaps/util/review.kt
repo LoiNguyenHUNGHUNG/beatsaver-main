@@ -320,6 +320,7 @@ fun Application.reviewListeners(client: HttpClient) {
 
         consumeAck("bm.sentiment", ReviewUpdateInfo::class) { _, r ->
             transaction {
+                modelPostgresOperation()
                 Beatmap
                     .join(reviewSubquery, JoinType.INNER, Beatmap.id, reviewSubquery[Review.mapId])
                     .update({ Beatmap.id eq r.mapId }) {
@@ -333,6 +334,7 @@ fun Application.reviewListeners(client: HttpClient) {
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.reviewDiscordHook", ReviewUpdateInfo::class) { _, r ->
                 transaction {
+                    modelPostgresOperation()
                     Review
                         .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
                         .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
@@ -359,6 +361,7 @@ fun Application.reviewListeners(client: HttpClient) {
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.replyDiscordHook", Int::class) { _, replyId ->
                 transaction {
+                    modelPostgresOperation()
                     ReviewReply
                         .join(Review, JoinType.INNER, ReviewReply.reviewId, Review.id)
                         .join(reviewerAlias, JoinType.INNER, ReviewReply.userId, reviewerAlias[User.id])
@@ -384,6 +387,7 @@ fun Application.reviewListeners(client: HttpClient) {
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.issuesDiscordHook", Int::class) { _, issueId ->
                 transaction {
+                    modelPostgresOperation()
                     Issue
                         .join(IssueComment, JoinType.LEFT, Issue.id, IssueComment.issueId)
                         .joinUser(Issue.creator)

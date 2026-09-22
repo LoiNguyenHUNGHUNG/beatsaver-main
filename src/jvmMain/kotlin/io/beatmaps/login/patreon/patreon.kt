@@ -9,6 +9,7 @@ import io.beatmaps.common.json
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
 import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.requireAuthorization
 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
@@ -153,6 +154,7 @@ fun Route.patreonLink(client: HttpClient) {
                     )
 
                     transaction {
+                        modelPostgresOperation()
                         PatreonLog.insert {
                             it[type] = "login"
                             it[text] = responseText
@@ -166,6 +168,7 @@ fun Route.patreonLink(client: HttpClient) {
                     val tierObj = response.getIncluded<PatreonTier>(PatreonTier).maxByOrNull { it.attributes.amountCents ?: Int.MIN_VALUE }
 
                     transaction {
+                        modelPostgresOperation()
                         Patreon.upsert(Patreon.id) {
                             it[id] = user.id.toInt()
                             it[pledge] = membership?.attributes?.currentlyEntitledAmountCents
@@ -205,6 +208,7 @@ fun Route.patreonLink(client: HttpClient) {
         }
 
         transaction {
+            modelPostgresOperation()
             PatreonLog.insert {
                 it[type] = event ?: ""
                 it[text] = hookContent
@@ -218,6 +222,7 @@ fun Route.patreonLink(client: HttpClient) {
         val tierObj = hook.getIncluded<PatreonTier>(PatreonTier).maxByOrNull { it.attributes.amountCents ?: Int.MIN_VALUE }
 
         transaction {
+            modelPostgresOperation()
             Patreon.upsert(Patreon.id) {
                 it[id] = user.id.toInt()
                 it[pledge] = membership.attributes.currentlyEntitledAmountCents

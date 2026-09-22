@@ -15,6 +15,7 @@ import io.beatmaps.common.util.requireParams
 import io.beatmaps.genericPage
 import io.beatmaps.login.Session
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
 import io.ktor.server.resources.get
@@ -80,6 +81,7 @@ fun Route.playlistController() {
         val isAdmin = sess?.isAdmin() == true
 
         val playlistData = transaction {
+            modelPostgresOperation()
             Playlist
                 .selectAll()
                 .where {

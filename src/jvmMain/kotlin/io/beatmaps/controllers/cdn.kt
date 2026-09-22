@@ -24,6 +24,8 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.common.util.returnFile
 import io.beatmaps.login.Session
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.ktor.resources.Resource
 import io.ktor.server.plugins.NotFoundException
 import io.ktor.server.plugins.origin
@@ -167,6 +169,7 @@ fun Route.cdnRoute() {
         val file = File(Folders.localFolder(it.file, false), "${it.file}.zip")
         val name = if (file.exists()) {
             transaction {
+                modelPostgresOperation()
                 Beatmap
                     .join(Versions, JoinType.INNER, onColumn = Beatmap.id, otherColumn = Versions.mapId)
                     .selectAll()
@@ -187,6 +190,7 @@ fun Route.cdnRoute() {
                         }
                     }
             }?.also { _ ->
+                modelRabbitMqOperation()
                 call.pub("beatmaps", "download.hash.${it.file}", null, DownloadInfo(it.file, DownloadType.HASH, call.request.origin.remoteHost))
             }
         } else {
@@ -199,6 +203,7 @@ fun Route.cdnRoute() {
     getWithOptions<CDN.BeatSaver> {
         val res = try {
             transaction {
+                modelPostgresOperation()
                 Beatmap.joinVersions(false)
                     .selectAll()
                     .where {
@@ -211,6 +216,7 @@ fun Route.cdnRoute() {
                             val file = File(Folders.localFolder(version.hash, false), "${version.hash}.zip")
 
                             if (file.exists()) {
+                                modelRabbitMqOperation()
                                 call.pub("beatmaps", "download.key.${it.file}", null, DownloadInfo(it.file, DownloadType.KEY, call.request.origin.remoteHost))
                             }
 
@@ -236,6 +242,7 @@ fun Route.cdnRoute() {
     get<CDN.BSAudio> {
         try {
             transaction {
+                modelPostgresOperation()
                 VersionsDao.wrapRows(
                     Beatmap.joinVersions(false).selectAll()
                         .where {

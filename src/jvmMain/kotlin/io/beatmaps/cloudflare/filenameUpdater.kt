@@ -11,6 +11,7 @@ import io.beatmaps.common.dbo.VersionsDao
 import io.beatmaps.common.util.CDNUpdate
 import io.beatmaps.common.util.downloadFilename
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.modelPostgresOperation
 import io.ktor.client.HttpClient
 import io.ktor.server.application.Application
 import kotlinx.coroutines.sync.Semaphore
@@ -93,6 +94,7 @@ private suspend fun updateDownloadFilename(update: CDNUpdate, beatsaverKVStore: 
 
 private fun uploadToR2(update: CDNUpdate, r2Client: IR2Bucket) {
     val toUpload = transaction {
+        modelPostgresOperation()
         VersionsDao.wrapRows(
             Versions.join(Beatmap, JoinType.INNER, Versions.mapId, Beatmap.id).selectAll().where {
                 // Not uploaded, not beatsage, published
@@ -106,6 +108,7 @@ private fun uploadToR2(update: CDNUpdate, r2Client: IR2Bucket) {
     }
 
     transaction {
+        modelPostgresOperation()
         Versions.update({
             (Versions.hash inList toUpload) and (Versions.mapId eq update.mapId)
         }) {
@@ -116,6 +119,7 @@ private fun uploadToR2(update: CDNUpdate, r2Client: IR2Bucket) {
 
 private fun deleteFromR2(update: CDNUpdate, r2Client: IR2Bucket) {
     val toDelete = transaction {
+        modelPostgresOperation()
         VersionsDao.wrapRows(
             Versions.join(Beatmap, JoinType.INNER, Versions.mapId, Beatmap.id).selectAll().where {
                 // Uploaded, deleted or beatsage or not published
@@ -129,6 +133,7 @@ private fun deleteFromR2(update: CDNUpdate, r2Client: IR2Bucket) {
     }
 
     transaction {
+        modelPostgresOperation()
         Versions.update({
             (Versions.hash inList toDelete) and (Versions.mapId eq update.mapId)
         }) {

@@ -39,6 +39,8 @@ import io.beatmaps.util.GameTokenValidator
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.captchaIfPresent
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.optionalAuthorization
 import io.beatmaps.util.publishVersion
 import io.beatmaps.util.requireAuthorization
@@ -148,6 +150,7 @@ data class OculusAuthResponse(val success: Boolean, val error: String? = null)
 const val beatsaberAppid = 620980
 
 fun RoutingContext.getTestplayQueue(userId: Int?, includePlayed: Boolean, page: Long?) = transaction {
+    modelPostgresOperation()
     Beatmap
         .joinVersions(true) { Versions.state eq EMapState.Testplay }
         .joinUploader()
@@ -184,6 +187,7 @@ fun RoutingContext.getTestplayQueue(userId: Int?, includePlayed: Boolean, page: 
 }
 
 fun RoutingContext.getTestplayRecent(userId: Int, page: Long?) = transaction {
+    modelPostgresOperation()
     // Maybe a little bit cross-product, but not made worse by testplay info as only info from the current user is included
     // Beatmaps get grouped by complexToBeatmap and clients need to reconstruct the ordering
     Testplay
@@ -241,6 +245,7 @@ fun Route.testplayRoute(client: HttpClient) {
             }
 
             val valid = transaction {
+                modelPostgresOperation()
                 val user = UserDao.wrapRow(
                     User.joinPatreon().selectAll().where { User.id eq sess.userId }.handlePatreon().first()
                 )
@@ -291,6 +296,8 @@ fun Route.testplayRoute(client: HttpClient) {
 
             valid || throw ServerApiException("Error updating map state")
 
+            modelRabbitMqOperation()
+
             call.pub("beatmaps", "maps.${newState.mapId}.updated.state", null, newState.mapId)
             call.respond(HttpStatusCode.OK, ActionResponse.success())
         }
@@ -301,6 +308,7 @@ fun Route.testplayRoute(client: HttpClient) {
             val update = call.receive<FeedbackUpdate>()
 
             val valid = transaction {
+                modelPostgresOperation()
                 Versions.join(Beatmap, JoinType.INNER, onColumn = Versions.mapId, otherColumn = Beatmap.id).update({
                     (Versions.hash eq update.hash) and (Beatmap.uploader eq sess.userId)
                 }) {
@@ -338,6 +346,7 @@ fun Route.testplayRoute(client: HttpClient) {
             val mark = call.receive<MarkRequest>()
 
             transaction {
+                modelPostgresOperation()
                 val versionIdVal = if ((mark.removeFromQueue || mark.addToQueue) && sess.testplay) {
                     val urResult = Versions.updateReturning(
                         {
@@ -381,6 +390,7 @@ fun Route.testplayRoute(client: HttpClient) {
             testplayFeedbackSlots.withPermit {
                 captchaIfPresent(client, update.captcha) {
                     transaction {
+                        modelPostgresOperation()
                         val subQuery = Versions.select(Versions.id).where { Versions.hash eq update.hash }
 
                         if (update.captcha == null) {

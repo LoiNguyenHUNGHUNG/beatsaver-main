@@ -2,6 +2,7 @@ package io.beatmaps.login.server
 
 import io.beatmaps.common.dbo.OauthClient
 import io.beatmaps.common.dbo.OauthClientDao
+import io.beatmaps.util.modelPostgresOperation
 import nl.myndocs.oauth2.client.AuthorizedGrantType
 import nl.myndocs.oauth2.client.Client
 import nl.myndocs.oauth2.client.ClientService
@@ -11,6 +12,7 @@ import org.jetbrains.exposed.sql.transactions.transaction
 
 object DBClientService : ClientService {
     fun getClient(clientId: String, clientSecret: String? = null) = transaction {
+        modelPostgresOperation()
         OauthClient.selectAll().where {
             (OauthClient.clientId eq clientId).let { q ->
                 if (clientSecret != null) {
@@ -37,6 +39,7 @@ object DBClientService : ClientService {
 
     override fun validClient(client: Client, clientSecret: String): Boolean {
         return transaction {
+            modelPostgresOperation()
             !OauthClient.selectAll().where { (OauthClient.clientId eq client.clientId) and (OauthClient.secret eq clientSecret) }.empty()
         }
     }

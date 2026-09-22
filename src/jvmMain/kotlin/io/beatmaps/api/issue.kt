@@ -60,6 +60,8 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.optionalAuthorization
 import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.requireCaptcha
@@ -399,6 +401,7 @@ fun Route.issueRoute(client: HttpClient) {
                     req.captcha,
                     {
                         ActionResponse.success() to newSuspendedTransaction {
+                            modelPostgresOperation()
                             if (isSuspended(sess.userId, SuspensionType.Upload)) {
                                 // User is suspended
                                 throw UserApiException("Suspended account")
@@ -437,6 +440,7 @@ fun Route.issueRoute(client: HttpClient) {
             }
 
             if (issueId != null) {
+                modelRabbitMqOperation()
                 call.pub("beatmaps", "issues.$issueId.created", null, issueId)
                 call.respond(HttpStatusCode.Created, issueId)
             } else {
@@ -448,6 +452,7 @@ fun Route.issueRoute(client: HttpClient) {
     get<IssueApi.IssueDetail> {
         optionalAuthorization { _, sess ->
             val issue = transaction {
+                modelPostgresOperation()
                 val issue = Issue
                     .joinUser(Issue.creator)
                     .selectAll()
@@ -490,6 +495,7 @@ fun Route.issueRoute(client: HttpClient) {
 
             val issueUpdate = call.receive<IssueUpdateRequest>()
             val success = transaction {
+                modelPostgresOperation()
                 Issue.update({
                     (Issue.id eq req.id?.orNull()).let { q ->
                         if (sess.isAdmin()) {
@@ -521,6 +527,7 @@ fun Route.issueRoute(client: HttpClient) {
             val comment = call.receive<IssueCommentRequest>()
 
             val response = newSuspendedTransaction {
+                modelPostgresOperation()
                 if (isSuspended(sess.userId, SuspensionType.Upload)) {
                     // User is suspended
                     throw UserApiException("Suspended account")
@@ -599,6 +606,7 @@ fun Route.issueRoute(client: HttpClient) {
             val admin = sess.isAdmin()
 
             val ans = transaction {
+                modelPostgresOperation()
                 Issue
                     .joinUser(Issue.creator)
                     .selectAll()

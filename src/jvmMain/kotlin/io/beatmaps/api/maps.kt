@@ -52,6 +52,9 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.login.Session
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
+import io.beatmaps.util.modelSolrOperation
 import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.updateAlertCount
 import io.ktor.http.HttpStatusCode
@@ -316,6 +319,7 @@ fun Route.mapDetailRoute() {
                 val mapUpdate = call.receive<CurateMap>()
 
                 val result = transaction {
+                    modelPostgresOperation()
                     fun curateMap() =
                         Beatmap.update({
                             (Beatmap.id eq mapUpdate.id) and (Beatmap.uploader neq user.userId) and (if (mapUpdate.curated) Beatmap.curatedAt.isNull() else Beatmap.curatedAt.isNotNull())
@@ -380,7 +384,10 @@ fun Route.mapDetailRoute() {
                     }
                 }
 
-                if (result) call.pub("beatmaps", "maps.${mapUpdate.id}.updated.curation", null, mapUpdate.id)
+                if (result) {
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "maps.${mapUpdate.id}.updated.curation", null, mapUpdate.id)
+                }
                 call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
             }
         }
@@ -390,9 +397,11 @@ fun Route.mapDetailRoute() {
         requireAuthorization { _, user ->
             val mapUpdate = call.receive<AiDeclaration>()
             val result = transaction {
+                modelPostgresOperation()
                 val admin = user.isAdmin()
 
                 transaction {
+                    modelPostgresOperation()
                     Beatmap.updateReturning(
                         {
                             (Beatmap.id eq mapUpdate.id).let { q ->
@@ -426,7 +435,10 @@ fun Route.mapDetailRoute() {
                 }
             }
 
-            if (result) call.pub("beatmaps", "maps.${mapUpdate.id}.updated.ai", null, mapUpdate.id)
+            if (result) {
+                modelRabbitMqOperation()
+                call.pub("beatmaps", "maps.${mapUpdate.id}.updated.ai", null, mapUpdate.id)
+            }
             call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
         }
     }
@@ -438,6 +450,7 @@ fun Route.mapDetailRoute() {
             } else {
                 val mapUpdate = call.receive<MarkNsfw>()
                 val result = transaction {
+                    modelPostgresOperation()
                     Beatmap.updateReturning(
                         {
                             (Beatmap.id eq mapUpdate.id)
@@ -460,7 +473,10 @@ fun Route.mapDetailRoute() {
                     }
                 }
 
-                if (result) call.pub("beatmaps", "maps.${mapUpdate.id}.updated.nsfw", null, mapUpdate.id)
+                if (result) {
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "maps.${mapUpdate.id}.updated.nsfw", null, mapUpdate.id)
+                }
                 call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
             }
         }
@@ -475,6 +491,7 @@ fun Route.mapDetailRoute() {
             }
 
             val result = transaction {
+                modelPostgresOperation()
                 val oldData = if (user.isAdmin()) {
                     BeatmapDao.wrapRow(Beatmap.selectAll().where { Beatmap.id eq mapUpdate.id }.single())
                 } else {
@@ -543,7 +560,10 @@ fun Route.mapDetailRoute() {
             }
 
             val updateType = if (mapUpdate.deleted) "delete" else "info"
-            if (result) call.pub("beatmaps", "maps.${mapUpdate.id}.updated.$updateType", null, mapUpdate.id)
+            if (result) {
+                modelRabbitMqOperation()
+                call.pub("beatmaps", "maps.${mapUpdate.id}.updated.$updateType", null, mapUpdate.id)
+            }
             call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
         }
     }
@@ -558,6 +578,7 @@ fun Route.mapDetailRoute() {
 
             val result = if (tooMany != true && user.isCurator()) {
                 transaction {
+                    modelPostgresOperation()
                     val oldData = BeatmapDao.wrapRow(Beatmap.selectAll().where { Beatmap.id eq mapUpdate.id }.single())
 
                     fun updateMap() =
@@ -583,7 +604,10 @@ fun Route.mapDetailRoute() {
                 false
             }
 
-            if (result) call.pub("beatmaps", "maps.${mapUpdate.id}.updated.info", null, mapUpdate.id)
+            if (result) {
+                modelRabbitMqOperation()
+                call.pub("beatmaps", "maps.${mapUpdate.id}.updated.info", null, mapUpdate.id)
+            }
             call.respond(if (result) HttpStatusCode.OK else HttpStatusCode.BadRequest)
         }
     }
@@ -593,6 +617,7 @@ fun Route.mapDetailRoute() {
         val isAdmin = sess?.isAdmin() == true
         val r = try {
             transaction {
+                modelPostgresOperation()
                 Beatmap
                     .joinVersions(true, state = null) // Allow returning non-published versions
                     .joinUploader()
@@ -633,6 +658,7 @@ fun Route.mapDetailRoute() {
         requireAuthorization { _, sess ->
             try {
                 transaction {
+                    modelPostgresOperation()
                     Playlist.joinMaps {
                         PlaylistMap.mapId eq mapId.toInt(16)
                     }.selectAll().where {
@@ -654,6 +680,7 @@ fun Route.mapDetailRoute() {
 
     getWithOptions<MapsApi.Beatsaver> {
         val r = transaction {
+            modelPostgresOperation()
             Beatmap
                 .joinVersions(true)
                 .joinUploader()
@@ -686,6 +713,7 @@ fun Route.mapDetailRoute() {
     get<MapsApi.BeatsaverDownload> { k ->
         val r = try {
             transaction {
+                modelPostgresOperation()
                 Beatmap
                     .joinVersions(true)
                     .selectAll()
@@ -715,6 +743,7 @@ fun Route.mapDetailRoute() {
         val isAdmin = sess?.isAdmin() == true
         val r = try {
             transaction {
+                modelPostgresOperation()
                 Beatmap
                     .joinVersions(true, state = null)
                     .joinUploader()
@@ -747,6 +776,7 @@ fun Route.mapDetailRoute() {
 
     getWithOptions<MapsApi.ByHash>("Get map(s) for a map hash".responds(ok<MapDetail>(), notFound())) {
         val r = transaction {
+            modelPostgresOperation()
             val rawHashes = it.hash.lowercase().split(',', ignoreCase = false).take(50)
             val singleRequest = rawHashes.size <= 1
 
@@ -795,6 +825,7 @@ fun Route.mapDetailRoute() {
     get<MapsApi.WIP> { r ->
         requireAuthorization { _, sess ->
             val beatmaps = transaction {
+                modelPostgresOperation()
                 Beatmap
                     .joinVersions(true, state = null)
                     .joinUploader()
@@ -834,6 +865,7 @@ fun Route.mapDetailRoute() {
     getWithOptions<MapsApi.ByUploader>("Get maps by a user".responds(ok<SearchResponse>())) {
         val sess = call.sessions.get<Session>()
         val beatmaps = transaction {
+            modelPostgresOperation()
             Beatmap
                 .joinVersions(true)
                 .joinUploader()
@@ -870,9 +902,11 @@ fun Route.mapDetailRoute() {
             .notNullOpt(it.id) { o -> BsSolr.mapperIds eq o }
             .setSort(BsSolr.uploaded.desc())
             .paged(pageSize = it.pageSize.or(20).coerceIn(1, 100))
+            .also { modelSolrOperation() }
             .getIds(BsSolr, call = call)
 
         val beatmaps = newSuspendedTransaction {
+            modelPostgresOperation()
             Beatmap
                 .joinVersions(true)
                 .joinUploader()
@@ -909,6 +943,7 @@ fun Route.mapDetailRoute() {
         }
 
         val beatmaps = transaction {
+            modelPostgresOperation()
             Beatmap
                 .joinVersions(true)
                 .joinUploader()
@@ -961,6 +996,7 @@ fun Route.mapDetailRoute() {
     ) {
         val sortField = Beatmap.deletedAt
         val beatmaps = transaction {
+            modelPostgresOperation()
             Beatmap
                 .select(Beatmap.id, Beatmap.deletedAt)
                 .where {
@@ -986,6 +1022,7 @@ fun Route.mapDetailRoute() {
 
     getWithOptions<MapsApi.ByPlayCount>("Get maps ordered by play count (Not currently tracked)".responds(ok<SearchResponse>())) {
         val beatmaps = transaction {
+            modelPostgresOperation()
             Beatmap
                 .joinVersions(true)
                 .joinUploader()

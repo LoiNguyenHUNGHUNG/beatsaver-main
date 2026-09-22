@@ -24,6 +24,8 @@ import io.beatmaps.controllers.upload.validateFiles
 import io.beatmaps.genericPage
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.handleMultipart
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.client.HttpClient
 import io.ktor.resources.Resource
@@ -101,6 +103,7 @@ fun Route.uploadController(client: HttpClient) {
                                 .toFile(localFile)
 
                             transaction {
+                                modelPostgresOperation()
                                 User.update({ User.id eq sess.userId }) {
                                     it[avatar] = "${Config.cdnBase("", true)}/avatar/$filename"
                                     it[updatedAt] = NowExpression(updatedAt)
@@ -181,6 +184,8 @@ fun Route.uploadController(client: HttpClient) {
             }
 
             val newMapId = Upload.insertNewMap(extractedInfo, data, session, file)
+
+            modelRabbitMqOperation()
 
             call.pub("beatmaps", "maps.$newMapId.updated.upload", null, newMapId)
             call.respond(UploadResponse(toHexString(newMapId)))

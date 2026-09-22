@@ -16,6 +16,7 @@ import io.beatmaps.genericPage
 import io.beatmaps.login.Session
 import io.beatmaps.previewBaseUrl
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
 import io.ktor.server.resources.get
@@ -121,6 +122,7 @@ fun Route.mapController() {
         val sess = call.sessions.get<Session>()
 
         transaction {
+            modelPostgresOperation()
             Beatmap
                 .join(Versions, JoinType.INNER, onColumn = Beatmap.id, otherColumn = Versions.mapId)
                 .selectAll()
@@ -153,6 +155,7 @@ fun Route.mapController() {
 
         val mapData = try {
             transaction {
+                modelPostgresOperation()
                 Beatmap
                     .joinUploader()
                     .joinCollaborators()
@@ -216,6 +219,7 @@ fun Route.mapController() {
     get<BeatmapController.RedirectOld> {
         try {
             transaction {
+                modelPostgresOperation()
                 Beatmap.selectAll().where {
                     Beatmap.id eq it.key.toInt(16)
                 }.limit(1).map { MapDetail.from(it, "") }.firstOrNull()

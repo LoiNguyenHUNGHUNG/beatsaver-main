@@ -16,6 +16,8 @@ import io.beatmaps.util.IMAGE_RESPONSE_MAX_BYTES
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
 import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
@@ -136,6 +138,7 @@ fun Route.discordLogin(client: HttpClient) {
                 val avatarLocal = data.avatar?.let { discordHelper.downloadDiscordAvatar(it, data.id) }
 
                 val (user, alertCount) = transaction {
+                    modelPostgresOperation()
                     val userId = User.upsert(User.discordId) {
                         it[name] = data.username
                         it[discordId] = data.id
@@ -147,6 +150,7 @@ fun Route.discordLogin(client: HttpClient) {
                 }
 
                 call.sessions.set(Session.fromUser(user, alertCount, call = call))
+                modelRabbitMqOperation()
                 call.pub("beatmaps", "user.${user.id.value}.updated.active", null, user.id.value)
                 req.state?.let { String(hex(it)) }.orEmpty().let { query ->
                     if (query.isNotEmpty() && query.contains("client_id")) {
@@ -166,6 +170,7 @@ fun Route.discordLogin(client: HttpClient) {
                     val data = call.getDiscordData()
 
                     newSuspendedTransaction {
+                        modelPostgresOperation()
                         val (existingMaps, dualAccount) = User
                             .join(Beatmap, JoinType.LEFT, User.id, Beatmap.uploader) {
                                 Beatmap.deletedAt.isNull()
@@ -206,6 +211,7 @@ fun Route.discordLogin(client: HttpClient) {
 
                         deadUserId
                     }?.let { userId ->
+                        modelRabbitMqOperation()
                         call.pub("beatmaps", "user.$userId.updated.active", null, userId)
                     }
 

@@ -5,6 +5,7 @@ import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.login.server.DBClientService
 import io.beatmaps.login.server.toIdentity
+import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
@@ -49,6 +50,7 @@ fun Route.questRoute(deviceCodeStore: InMemoryDeviceCodeStore) {
 
         requireAuthorization { _, sess ->
             newSuspendedTransaction {
+                modelPostgresOperation()
                 User.selectAll().where {
                     (User.id eq sess.userId)
                 }.firstOrNull()?.let { UserDao.wrapRow(it) }
