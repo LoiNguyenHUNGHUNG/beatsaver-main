@@ -6,6 +6,7 @@ import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.genericPage
 import io.beatmaps.login.Session
+import io.beatmaps.util.modelPostgresOperation
 import io.ktor.http.HttpMethod
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
@@ -83,6 +84,7 @@ fun Application.installOauth2(deviceCodeStore: InMemoryDeviceCodeStore) {
 
             override fun validCredentials(forClient: Client, identity: Identity, password: String) =
                 transaction {
+                    modelPostgresOperation()
                     !User.selectAll().where { (User.id eq identity.username.toInt()) and User.active }.empty()
                 }
         }

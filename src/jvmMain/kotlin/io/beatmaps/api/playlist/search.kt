@@ -34,6 +34,8 @@ import io.beatmaps.common.solr.field.apply
 import io.beatmaps.common.solr.getIds
 import io.beatmaps.common.solr.paged
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelSolrOperation
 import io.beatmaps.util.optionalAuthorization
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -61,6 +63,7 @@ fun Route.playlistSearch() {
             }
 
             val playlists = transaction {
+                modelPostgresOperation()
                 Playlist
                     .joinMaps()
                     .joinPlaylistCurator()
@@ -100,6 +103,7 @@ fun Route.playlistSearch() {
         val actualSortOrder = searchInfo.validateSearchOrder(req.order.or(req.sortOrder.or(SearchOrder.Relevance)))
 
         newSuspendedTransaction {
+            modelPostgresOperation()
             val results = PlaylistSolr.newQuery()
                 .let { q ->
                     searchInfo.applyQuery(q)
@@ -126,6 +130,7 @@ fun Route.playlistSearch() {
                     PlaylistSolr.addSortArgs(q, req.seed.hashCode(), actualSortOrder, req.ascending ?: false)
                 }
                 .paged(req.page.or(0).toInt())
+                .also { modelSolrOperation() }
                 .getIds(PlaylistSolr, call = call)
 
             val playlists = Playlist
@@ -160,6 +165,7 @@ fun Route.playlistSearch() {
         }.toTypedArray()
 
         newSuspendedTransaction {
+            modelPostgresOperation()
             val playlists = Playlist
                 .joinMaps()
                 .joinUser(Playlist.owner)
@@ -208,6 +214,7 @@ fun Route.playlistSearch() {
         optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
             fun <T> doQuery(table: Query = Playlist.selectAll(), groupBy: Array<Column<*>> = arrayOf(Playlist.id), block: (ResultRow) -> T) =
                 transaction {
+                    modelPostgresOperation()
                     table
                         .where {
                             Playlist.id.inSubQuery(
@@ -266,6 +273,7 @@ fun Route.playlistSearch() {
         optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
             fun <T> doQuery(table: Query = Playlist.selectAll(), groupBy: Array<Column<*>> = arrayOf(Playlist.id), block: (ResultRow) -> T) =
                 transaction {
+                    modelPostgresOperation()
                     table
                         .where {
                             Playlist.id.inSubQuery(

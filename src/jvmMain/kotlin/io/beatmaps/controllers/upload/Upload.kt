@@ -26,6 +26,7 @@ import io.beatmaps.controllers.MapUploadMultipart
 import io.beatmaps.controllers.UploadException
 import io.beatmaps.controllers.userWipCount
 import io.beatmaps.login.Session
+import io.beatmaps.util.modelPostgresOperation
 import kotlinx.datetime.Clock
 import kotlinx.datetime.toKotlinInstant
 import org.jetbrains.exposed.dao.id.EntityID
@@ -48,6 +49,7 @@ object Upload {
 
     fun checkUserCanUpload(session: Session): Pair<UserDao, Boolean> {
         val (user, patreon, currentWipCount, isSuspended) = transaction {
+            modelPostgresOperation()
             val user = UserDao.wrapRow(
                 User.joinPatreon().selectAll().where { User.id eq session.userId }.handlePatreon().first()
             )
@@ -127,6 +129,7 @@ object Upload {
     }
 
     fun insertNewMap(info: ExtractedInfo, data: MapUploadMultipart, session: Session, file: File) = transaction {
+        modelPostgresOperation()
         // Process upload
         val newFile = File(Folders.localFolder(info.digest), "${info.digest}.zip")
 

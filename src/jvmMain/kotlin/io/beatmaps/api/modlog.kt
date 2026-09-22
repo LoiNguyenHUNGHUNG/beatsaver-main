@@ -22,6 +22,7 @@ import io.beatmaps.common.dbo.joinUser
 import io.beatmaps.common.or
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
+import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
@@ -71,6 +72,7 @@ fun Route.modLogRoute() {
                 call.respond(HttpStatusCode.BadRequest)
             } else {
                 val entries = transaction {
+                    modelPostgresOperation()
                     ModLog
                         .join(curatorAlias, JoinType.LEFT, ModLog.opBy, curatorAlias[User.id])
                         .joinUser(ModLog.targetUser)

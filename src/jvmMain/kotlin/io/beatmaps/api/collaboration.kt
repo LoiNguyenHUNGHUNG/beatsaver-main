@@ -23,6 +23,8 @@ import io.beatmaps.common.dbo.collaboratorAlias
 import io.beatmaps.common.dbo.joinUploader
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.isUploader
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.updateAlertCount
 import io.ktor.http.HttpStatusCode
@@ -92,6 +94,7 @@ fun Route.collaborationRoute() {
             val req = call.receive<CollaborationRequestData>()
 
             val success = transaction {
+                modelPostgresOperation()
                 (isUploader(req.mapId, sess.userId) && !isSuspended(sess.userId, SuspensionType.Upload)).also { authorized ->
                     if (authorized) {
                         Collaboration.insertAndGetId {
@@ -113,6 +116,7 @@ fun Route.collaborationRoute() {
 
             // map is null when the collaboration has not been accepted
             val (success, map) = transaction {
+                modelPostgresOperation()
                 if (req.accepted) {
                     val (collab, map, published) = Collaboration
                         .join(Beatmap, JoinType.LEFT, Collaboration.mapId, Beatmap.id) { Beatmap.deletedAt.isNull() }
@@ -186,7 +190,10 @@ fun Route.collaborationRoute() {
                 }
             }
 
-            if (success && map != null) call.pub("beatmaps", "maps.${map.id}.updated.collaborators", null, map.id.value)
+            if (success && map != null) {
+                modelRabbitMqOperation()
+                call.pub("beatmaps", "maps.${map.id}.updated.collaborators", null, map.id.value)
+            }
             call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
         }
     }
@@ -196,13 +203,17 @@ fun Route.collaborationRoute() {
             val req = call.receive<CollaborationRemoveData>()
 
             val success = transaction {
+                modelPostgresOperation()
                 (isUploader(req.mapId, sess.userId) || sess.userId == req.collaboratorId || sess.isAdmin()) &&
                     Collaboration.deleteWhere {
                         mapId eq req.mapId and (collaboratorId eq req.collaboratorId)
                     } > 0
             }
 
-            if (success) call.pub("beatmaps", "maps.${req.mapId}.updated.collaborators", null, req.mapId)
+            if (success) {
+                modelRabbitMqOperation()
+                call.pub("beatmaps", "maps.${req.mapId}.updated.collaborators", null, req.mapId)
+            }
 
             call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
         }
@@ -213,6 +224,7 @@ fun Route.collaborationRoute() {
             val mapId = it.id.toInt(16)
 
             val collaborations = transaction {
+                modelPostgresOperation()
                 if (isUploader(mapId, sess.userId) || sess.admin) {
                     Collaboration
                         .join(collaboratorAlias, JoinType.LEFT, Collaboration.collaboratorId, collaboratorAlias[User.id])

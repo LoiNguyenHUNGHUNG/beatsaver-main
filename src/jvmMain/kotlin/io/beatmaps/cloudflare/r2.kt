@@ -5,6 +5,7 @@ import com.amazonaws.auth.BasicAWSCredentials
 import com.amazonaws.client.builder.AwsClientBuilder
 import com.amazonaws.services.s3.AmazonS3
 import com.amazonaws.services.s3.AmazonS3ClientBuilder
+import io.beatmaps.util.modelR2Operation
 import java.io.File
 
 interface IR2Bucket {
@@ -49,10 +50,12 @@ class R2(accountId: String, accessKey: String, secretKey: String) {
     fun getBucket(bucketName: String): IR2Bucket = R2Bucket(this, bucketName)
 
     private fun uploadFile(bucketName: String, file: File) {
+        modelR2Operation()
         r2Client.putObject(bucketName, file.name, file)
     }
 
     private fun deleteFile(bucketName: String, key: String) {
+        modelR2Operation()
         r2Client.deleteObject(bucketName, key)
     }
 }

@@ -21,6 +21,7 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.login.Session
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.updateAlertCount
 import io.ktor.http.HttpStatusCode
@@ -144,6 +145,7 @@ fun UserAlert.Companion.from(collaboration: CollaborationDetail) = collaboration
 
 fun Route.alertsRoute() {
     fun RoutingContext.getAlerts(userId: Int, read: Boolean, page: Long? = null, type: List<EAlertType>? = null): List<UserAlert> = transaction {
+        modelPostgresOperation()
         val (s0, s1) = intLiteral(0).alias("s") to intLiteral(1).alias("s")
 
         val collabQuery = Collaboration
@@ -236,7 +238,10 @@ fun Route.alertsRoute() {
 
     get<AlertsApi.Stats> {
         requireAuthorization(OauthScope.ALERTS) { _, sess ->
-            val (statParts, user) = transaction { getStats(sess.userId) to UserDao[sess.userId] }
+            val (statParts, user) = transaction {
+                modelPostgresOperation()
+                getStats(sess.userId) to UserDao[sess.userId]
+            }
 
             call.respond(UserAlertStats.fromParts(statParts).copy(reviewAlerts = user.reviewAlerts, curationAlerts = user.curationAlerts, followAlerts = user.followAlerts))
         }
@@ -247,6 +252,7 @@ fun Route.alertsRoute() {
             val req = call.receive<AlertOptionsRequest>()
 
             transaction {
+                modelPostgresOperation()
                 User.update({
                     User.id eq sess.userId
                 }) {
@@ -263,7 +269,10 @@ fun Route.alertsRoute() {
 
     suspend fun RoutingContext.respondStats(sess: Session, stats: List<StatPart>?) =
         if (stats != null) {
-            val user = transaction { UserDao[sess.userId] }
+            val user = transaction {
+                modelPostgresOperation()
+                UserDao[sess.userId]
+            }
 
             updateAlertCount(sess.userId)
             call.respond(UserAlertStats.fromParts(stats).copy(reviewAlerts = user.reviewAlerts, curationAlerts = user.curationAlerts, followAlerts = user.followAlerts))
@@ -276,6 +285,7 @@ fun Route.alertsRoute() {
 
         requireAuthorization(OauthScope.MARK_ALERTS) { _, user ->
             val stats = transaction {
+                modelPostgresOperation()
                 val result = AlertRecipient
                     .join(Alert, JoinType.INNER, AlertRecipient.alertId, Alert.id)
                     .update({
@@ -304,6 +314,7 @@ fun Route.alertsRoute() {
 
         requireAuthorization(OauthScope.MARK_ALERTS) { _, user ->
             val stats = transaction {
+                modelPostgresOperation()
                 val result = AlertRecipient.update({
                     AlertRecipient.readAt.run { if (req.read) isNull() else isNotNull() } and
                         (AlertRecipient.recipientId eq user.userId)

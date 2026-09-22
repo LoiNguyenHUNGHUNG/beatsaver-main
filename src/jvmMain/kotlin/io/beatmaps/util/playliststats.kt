@@ -22,6 +22,7 @@ fun Application.playlistStats() {
     rabbitOptional {
         consumeAck("bm.mapPlaylistTrigger", Int.serializer()) { _, mapId ->
             transaction {
+                modelPostgresOperation()
                 PlaylistMapDao.wrapRows(
                     PlaylistMap.selectAll()
                         .where {
@@ -29,12 +30,14 @@ fun Application.playlistStats() {
                         }
                 ).toList()
             }.forEach {
+                modelRabbitMqOperation()
                 publish("beatmaps", "playlists.${it.playlistId}.stats", null, it.playlistId.value)
             }
         }
 
         consumeAck("bm.playlistStats", Int.serializer()) { _, playlistId ->
             transaction {
+                modelPostgresOperation()
                 val beatmaps = Beatmap
                     .joinVersions()
                     .join(PlaylistMap, JoinType.INNER, Beatmap.id, PlaylistMap.mapId)
@@ -56,6 +59,8 @@ fun Application.playlistStats() {
                     it[maxNps] = maxNpsVal
                 }
             }
+
+            modelRabbitMqOperation()
 
             publish("beatmaps", "playlists.$playlistId.updated.stats", null, playlistId)
         }

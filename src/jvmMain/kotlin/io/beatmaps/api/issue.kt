@@ -58,7 +58,10 @@ import io.beatmaps.common.dbo.reviewerAlias
 import io.beatmaps.common.or
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.optionalAuthorization
 import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.requireCaptcha
@@ -73,6 +76,8 @@ import io.ktor.server.resources.post
 import io.ktor.server.resources.put
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.toKotlinInstant
 import kotlinx.serialization.UseSerializers
 import org.jetbrains.exposed.dao.Entity
@@ -382,53 +387,60 @@ fun IssueCommentDetail.Companion.from(other: IssueCommentDao) = IssueCommentDeta
     other.updatedAt.toKotlinInstant()
 )
 
+private val issueCreateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val issueCommentSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun Route.issueRoute(client: HttpClient) {
     post<IssueApi.Issue> {
         requireAuthorization { _, sess ->
             val req = call.receive<IssueCreationRequest>()
 
-            val (res, issueId) = requireCaptcha(
-                client,
-                req.captcha,
-                {
-                    ActionResponse.success() to newSuspendedTransaction {
-                        if (isSuspended(sess.userId, SuspensionType.Upload)) {
-                            // User is suspended
-                            throw UserApiException("Suspended account")
-                        }
+            val (res, issueId) = issueCreateSlots.withPermit {
+                requireCaptcha(
+                    client,
+                    req.captcha,
+                    {
+                        ActionResponse.success() to newSuspendedTransaction {
+                            modelPostgresOperation()
+                            if (isSuspended(sess.userId, SuspensionType.Upload)) {
+                                // User is suspended
+                                throw UserApiException("Suspended account")
+                            }
 
-                        Issue.insertAndGetId {
-                            it[creator] = sess.userId
-                            it[createdAt] = NowExpression(createdAt)
-                            it[updatedAt] = NowExpression(updatedAt)
-                            it[type] = req.type
-                            it[data] = createDbIssue(req.type, req.id)
-                        }.also { newId ->
-                            IssueComment.insert {
-                                it[issueId] = newId
-                                it[text] = req.text.take(IssueConstants.MAX_COMMENT_LENGTH)
-                                it[userId] = sess.userId
-                                it[public] = true
-
+                            Issue.insertAndGetId {
+                                it[creator] = sess.userId
                                 it[createdAt] = NowExpression(createdAt)
                                 it[updatedAt] = NowExpression(updatedAt)
+                                it[type] = req.type
+                                it[data] = createDbIssue(req.type, req.id)
+                            }.also { newId ->
+                                IssueComment.insert {
+                                    it[issueId] = newId
+                                    it[text] = req.text.take(IssueConstants.MAX_COMMENT_LENGTH)
+                                    it[userId] = sess.userId
+                                    it[public] = true
+
+                                    it[createdAt] = NowExpression(createdAt)
+                                    it[updatedAt] = NowExpression(updatedAt)
+                                }
+                            }.value.also {
+                                Alert.insert(
+                                    "You created an issue",
+                                    "You created a ${req.type.name} issue {$it}",
+                                    EAlertType.Issue,
+                                    sess.userId
+                                )
+                                updateAlertCount(sess.userId)
                             }
-                        }.value.also {
-                            Alert.insert(
-                                "You created an issue",
-                                "You created a ${req.type.name} issue {$it}",
-                                EAlertType.Issue,
-                                sess.userId
-                            )
-                            updateAlertCount(sess.userId)
                         }
                     }
+                ) {
+                    it.toActionResponse() to null
                 }
-            ) {
-                it.toActionResponse() to null
             }
 
             if (issueId != null) {
+                modelRabbitMqOperation()
                 call.pub("beatmaps", "issues.$issueId.created", null, issueId)
                 call.respond(HttpStatusCode.Created, issueId)
             } else {
@@ -440,6 +452,7 @@ fun Route.issueRoute(client: HttpClient) {
     get<IssueApi.IssueDetail> {
         optionalAuthorization { _, sess ->
             val issue = transaction {
+                modelPostgresOperation()
                 val issue = Issue
                     .joinUser(Issue.creator)
                     .selectAll()
@@ -482,6 +495,7 @@ fun Route.issueRoute(client: HttpClient) {
 
             val issueUpdate = call.receive<IssueUpdateRequest>()
             val success = transaction {
+                modelPostgresOperation()
                 Issue.update({
                     (Issue.id eq req.id?.orNull()).let { q ->
                         if (sess.isAdmin()) {
@@ -513,6 +527,7 @@ fun Route.issueRoute(client: HttpClient) {
             val comment = call.receive<IssueCommentRequest>()
 
             val response = newSuspendedTransaction {
+                modelPostgresOperation()
                 if (isSuspended(sess.userId, SuspensionType.Upload)) {
                     // User is suspended
                     throw UserApiException("Suspended account")
@@ -538,28 +553,30 @@ fun Route.issueRoute(client: HttpClient) {
 
                 val commentId = req.commentId?.orNull()
                 if (commentId == null) {
-                    requireCaptcha(
-                        client,
-                        comment.captcha,
-                        {
-                            if (!(userPrivileged || sess.userId == intermediaryResult.creatorId.value)) {
-                                rollback()
-                                return@requireCaptcha ActionResponse.error("Unauthorised")
-                            }
-
-                            IssueComment
-                                .insertAndGetId {
-                                    it[issueId] = req.id.or(0)
-                                    it[userId] = sess.userId
-                                    it[text] = comment.text?.take(IssueConstants.MAX_COMMENT_LENGTH) ?: ""
-                                    it[public] = if (!userPrivileged) { true } else { comment.public ?: false }
-                                    it[createdAt] = NowExpression(createdAt)
-                                    it[updatedAt] = NowExpression(updatedAt)
+                    issueCommentSlots.withPermit {
+                        requireCaptcha(
+                            client,
+                            comment.captcha,
+                            {
+                                if (!(userPrivileged || sess.userId == intermediaryResult.creatorId.value)) {
+                                    rollback()
+                                    return@requireCaptcha ActionResponse.error("Unauthorised")
                                 }
 
-                            ActionResponse.success()
-                        }
-                    ) { it.toActionResponse() }
+                                IssueComment
+                                    .insertAndGetId {
+                                        it[issueId] = req.id.or(0)
+                                        it[userId] = sess.userId
+                                        it[text] = comment.text?.take(IssueConstants.MAX_COMMENT_LENGTH) ?: ""
+                                        it[public] = if (!userPrivileged) { true } else { comment.public ?: false }
+                                        it[createdAt] = NowExpression(createdAt)
+                                        it[updatedAt] = NowExpression(updatedAt)
+                                    }
+
+                                ActionResponse.success()
+                            }
+                        ) { it.toActionResponse() }
+                    }
                 } else {
                     val success = IssueComment
                         .update({
@@ -589,6 +606,7 @@ fun Route.issueRoute(client: HttpClient) {
             val admin = sess.isAdmin()
 
             val ans = transaction {
+                modelPostgresOperation()
                 Issue
                     .joinUser(Issue.creator)
                     .selectAll()

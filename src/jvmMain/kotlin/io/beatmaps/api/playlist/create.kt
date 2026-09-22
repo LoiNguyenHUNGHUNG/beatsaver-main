@@ -23,13 +23,18 @@ import io.beatmaps.common.or
 import io.beatmaps.common.util.copyToSuspend
 import io.beatmaps.controllers.UploadException
 import io.beatmaps.login.Session
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.handleMultipart
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.client.HttpClient
 import io.ktor.server.resources.post
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.Serializable
 import net.coobird.thumbnailator.Thumbnails
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
@@ -80,6 +85,8 @@ fun typeFromReq(data: IPlaylistUpdate, sess: Session) =
     } ?: EPlaylistType.Private
 
 val thumbnailSizes = listOf(256, 512)
+private val playlistCreateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val playlistEditSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Route.playlistCreate(client: HttpClient) {
     post<PlaylistApi.Create> {
@@ -87,20 +94,22 @@ fun Route.playlistCreate(client: HttpClient) {
             val files = mutableMapOf<Int, File>()
 
             try {
-                val multipart = handleMultipart(client) { part ->
-                    val its = part.provider()
-                    val tmp = ByteArrayOutputStream()
-                    its.copyToSuspend(tmp, sizeLimit = FileLimits.PLAYLIST_IMAGE_LIMIT)
+                val multipart = playlistCreateSlots.withPermit {
+                    handleMultipart(client) { part ->
+                        val its = part.provider()
+                        val tmp = ByteArrayOutputStream()
+                        its.copyToSuspend(tmp, sizeLimit = FileLimits.PLAYLIST_IMAGE_LIMIT)
 
-                    thumbnailSizes.forEach { s ->
-                        files[s] = File(Folders.uploadTempFolder(), "upload-${System.currentTimeMillis()}-${sess.userId.hashCode()}-$s.jpg").also { localFile ->
-                            Thumbnails
-                                .of(tmp.toByteArray().inputStream())
-                                .size(s, s)
-                                .imageType(BufferedImage.TYPE_INT_RGB)
-                                .outputFormat("JPEG")
-                                .outputQuality(0.8)
-                                .toFile(localFile)
+                        thumbnailSizes.forEach { s ->
+                            files[s] = File(Folders.uploadTempFolder(), "upload-${System.currentTimeMillis()}-${sess.userId.hashCode()}-$s.jpg").also { localFile ->
+                                Thumbnails
+                                    .of(tmp.toByteArray().inputStream())
+                                    .size(s, s)
+                                    .imageType(BufferedImage.TYPE_INT_RGB)
+                                    .outputFormat("JPEG")
+                                    .outputQuality(0.8)
+                                    .toFile(localFile)
+                            }
                         }
                     }
                 }
@@ -109,6 +118,7 @@ fun Route.playlistCreate(client: HttpClient) {
                 val data = multipart.get<PlaylistCreateMultipart>()
 
                 val toCreate = newSuspendedTransaction {
+                    modelPostgresOperation()
                     PlaylistBasic(
                         0,
                         "",
@@ -127,6 +137,7 @@ fun Route.playlistCreate(client: HttpClient) {
                 }
 
                 val newId = transaction {
+                    modelPostgresOperation()
                     Playlist.insertAndGetId {
                         it[name] = toCreate.name
                         it[description] = data.description?.take(PlaylistConstants.MAX_DESCRIPTION_LENGTH) ?: ""
@@ -140,6 +151,8 @@ fun Route.playlistCreate(client: HttpClient) {
                     val localFile = File(Folders.localPlaylistCoverFolder(s), "$newId.jpg")
                     Files.move(temp.toPath(), localFile.toPath())
                 }
+
+                modelRabbitMqOperation()
 
                 call.pub("beatmaps", "playlists.$newId.created", null, newId)
                 call.respond(UploadResponse(newId.toString()))
@@ -162,30 +175,34 @@ fun Route.playlistCreate(client: HttpClient) {
             }
 
             val beforePlaylist = newSuspendedTransaction {
+                modelPostgresOperation()
                 Playlist.selectAll().where(query).firstOrNull()?.let { PlaylistFull.from(it, cdnPrefix()) }
             } ?: throw UploadException("Playlist not found")
 
-            val multipart = handleMultipart(client) { part ->
-                val its = part.provider()
-                val tmp = ByteArrayOutputStream()
-                its.copyToSuspend(tmp, sizeLimit = FileLimits.PLAYLIST_IMAGE_LIMIT)
+            val multipart = playlistEditSlots.withPermit {
+                handleMultipart(client) { part ->
+                    val its = part.provider()
+                    val tmp = ByteArrayOutputStream()
+                    its.copyToSuspend(tmp, sizeLimit = FileLimits.PLAYLIST_IMAGE_LIMIT)
 
-                thumbnailSizes.forEach { s ->
-                    val localFile = File(Folders.localPlaylistCoverFolder(s), "${req.id?.orNull()}.jpg")
+                    thumbnailSizes.forEach { s ->
+                        val localFile = File(Folders.localPlaylistCoverFolder(s), "${req.id?.orNull()}.jpg")
 
-                    Thumbnails
-                        .of(tmp.toByteArray().inputStream())
-                        .size(s, s)
-                        .imageType(BufferedImage.TYPE_INT_RGB)
-                        .outputFormat("JPEG")
-                        .outputQuality(0.8)
-                        .toFile(localFile)
+                        Thumbnails
+                            .of(tmp.toByteArray().inputStream())
+                            .size(s, s)
+                            .imageType(BufferedImage.TYPE_INT_RGB)
+                            .outputFormat("JPEG")
+                            .outputQuality(0.8)
+                            .toFile(localFile)
+                    }
                 }
             }
             val data = multipart.get<PlaylistEditMultipart>()
 
             val newDescription = data.description?.take(PlaylistConstants.MAX_DESCRIPTION_LENGTH) ?: ""
             val toCreate = newSuspendedTransaction {
+                modelPostgresOperation()
                 PlaylistBasic(
                     0, "",
                     data.name ?: "",
@@ -202,6 +219,7 @@ fun Route.playlistCreate(client: HttpClient) {
             }
 
             transaction {
+                modelPostgresOperation()
                 fun updatePlaylist() {
                     Playlist.update({
                         query
@@ -237,6 +255,8 @@ fun Route.playlistCreate(client: HttpClient) {
                     }
                 }
             }
+
+            modelRabbitMqOperation()
 
             call.pub("beatmaps", "playlists.${req.id}.updated.detail", null, req.id.or(0))
             call.respond(UploadResponse(req.id.toString()))

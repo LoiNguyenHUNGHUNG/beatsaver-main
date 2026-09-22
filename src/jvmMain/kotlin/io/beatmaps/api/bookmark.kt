@@ -27,6 +27,8 @@ import io.beatmaps.common.or
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
 import io.ktor.resources.Resource
 import io.ktor.server.plugins.NotFoundException
@@ -131,6 +133,7 @@ fun Route.bookmarkRoute() {
         requireAuthorization(OauthScope.BOOKMARKS) { _, sess ->
 
             val (updateCount, playlistId) = transaction {
+                modelPostgresOperation()
                 (req.key?.toIntOrNull(16) ?: req.hash?.let { mapIdForHash(it) })?.let { mapId ->
                     val playlistId = getNewId(sess.userId)
 
@@ -143,6 +146,7 @@ fun Route.bookmarkRoute() {
             }
 
             if (playlistId != null) {
+                modelRabbitMqOperation()
                 call.pub("beatmaps", "playlists.$playlistId.updated", null, playlistId)
             }
 
@@ -153,6 +157,7 @@ fun Route.bookmarkRoute() {
     get<BookmarksApi.Bookmarks> {
         requireAuthorization(OauthScope.BOOKMARKS) { _, sess ->
             val maps = transaction {
+                modelPostgresOperation()
                 PlaylistMap
                     .join(reviewerAlias, JoinType.LEFT, PlaylistMap.playlistId, reviewerAlias[User.bookmarksId])
                     .join(Beatmap, JoinType.LEFT, PlaylistMap.mapId, Beatmap.id)

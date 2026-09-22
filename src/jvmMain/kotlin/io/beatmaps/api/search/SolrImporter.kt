@@ -26,6 +26,8 @@ import io.beatmaps.common.solr.collections.PlaylistSolr
 import io.beatmaps.common.solr.collections.UserSolr
 import io.beatmaps.common.solr.insert
 import io.beatmaps.common.solr.insertMany
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelSolrOperation
 import io.ktor.server.application.Application
 import kotlinx.datetime.toKotlinInstant
 import kotlinx.serialization.builtins.serializer
@@ -45,6 +47,7 @@ import java.lang.Integer.toHexString
 object SolrImporter {
     private fun trigger(updateMapId: Int) {
         transaction {
+            modelPostgresOperation()
             val map = Beatmap
                 .joinVersions(true)
                 .joinUploader()
@@ -56,6 +59,7 @@ object SolrImporter {
                 .firstOrNull()
 
             if (map == null || map.deletedAt != null) {
+                modelSolrOperation()
                 BsSolr.delete(toHexString(updateMapId))
             } else {
                 val version = map.versions.values.firstOrNull()
@@ -65,6 +69,8 @@ object SolrImporter {
                     .filter { diff -> diff.characteristic == ECharacteristic.Standard }
                     .map { diff -> diff.difficulty }
                     .distinct().count() == 5
+
+                modelSolrOperation()
 
                 BsSolr.insert {
                     it[author] = version?.levelAuthorName
@@ -109,6 +115,7 @@ object SolrImporter {
 
     private fun triggerUser(updateUserId: Int) {
         transaction {
+            modelPostgresOperation()
             // Maps
             val mapStates = Beatmap
                 .joinVersions()
@@ -133,6 +140,8 @@ object SolrImporter {
                     it[Beatmap.id].value to it[boolColumn]
                 }
 
+            modelSolrOperation()
+
             BsSolr.insertMany(mapStates + collabStates) { it, (mId, v) ->
                 it[mapId] = toHexString(mId)
                 it.update(verified, v)
@@ -147,6 +156,8 @@ object SolrImporter {
                     it[Playlist.id].value to it[User.verifiedMapper]
                 }
 
+            modelSolrOperation()
+
             PlaylistSolr.insertMany(playlistStates) { it, (pId, v) ->
                 it[sId] = pId.toString()
                 it.update(verified, v)
@@ -156,6 +167,7 @@ object SolrImporter {
 
     private fun triggerUserInfo(updateUserId: Int) {
         transaction {
+            modelPostgresOperation()
             val countField = Playlist.id.count().alias("plcnt")
             val playlistSubquery = Playlist
                 .select(countField, Playlist.owner)
@@ -201,11 +213,14 @@ object SolrImporter {
                 } ?: (null to null)
 
             if (user == null || stats == null) {
+                modelSolrOperation()
                 UserSolr.delete(updateUserId.toString())
             } else {
                 val last = stats.lastUpload
                 val first = stats.firstUpload
                 val mapAgeValue = if (last != null && first != null) (last - first).inWholeDays.toInt() else null
+
+                modelSolrOperation()
 
                 UserSolr.insert {
                     it[id] = user.id
@@ -235,6 +250,7 @@ object SolrImporter {
 
     private fun triggerPlaylist(updatePlaylistId: Int) {
         transaction {
+            modelPostgresOperation()
             val mapIdsAgg = arrayAgg(PlaylistMap.mapId)
             val (playlist, verifiedMapper, pMapIds) = Playlist
                 .joinMaps()
@@ -252,8 +268,10 @@ object SolrImporter {
                 }
 
             if (playlist == null || playlist.deletedAt != null) {
+                modelSolrOperation()
                 PlaylistSolr.delete(updatePlaylistId.toString())
             } else {
+                modelSolrOperation()
                 PlaylistSolr.insert {
                     it[id] = updatePlaylistId
                     it[sId] = updatePlaylistId.toString()

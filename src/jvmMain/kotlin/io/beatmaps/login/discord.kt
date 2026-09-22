@@ -11,7 +11,15 @@ import io.beatmaps.common.db.upsert
 import io.beatmaps.common.dbo.Beatmap
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
+import io.beatmaps.util.IMAGE_REQUEST_TIMEOUT_MILLIS
+import io.beatmaps.util.IMAGE_RESPONSE_MAX_BYTES
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
+import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.requireAuthorization
+import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.plugins.retry
@@ -33,6 +41,8 @@ import io.ktor.server.sessions.sessions
 import io.ktor.server.sessions.set
 import io.ktor.util.StringValuesBuilder
 import io.ktor.util.hex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.and
@@ -55,6 +65,9 @@ data class DiscordUserInfo(
     val avatar: String?
 )
 
+private val discordLoginSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val discordLinkSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 class DiscordHelper(val client: HttpClient) {
     fun discordProvider(state: String?) = OAuthServerSettings.OAuth2ServerSettings(
         name = "discord",
@@ -72,6 +85,10 @@ class DiscordHelper(val client: HttpClient) {
         }
     )
 
+    @NetworkDownload(
+        maxBytes = IMAGE_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = IMAGE_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun getDiscordAvatar(discordAvatar: String, discordId: Long) =
         client.get("https://cdn.discordapp.com/avatars/$discordId/$discordAvatar.png") {
             timeout {
@@ -89,8 +106,15 @@ class DiscordHelper(val client: HttpClient) {
         return "${Config.cdnBase("", true)}/avatar/$fileName.png"
     }
 
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun getDiscordData(token: String) =
         client.get("https://discord.com/api/users/@me") {
+            timeout {
+                requestTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+            }
             retry {
                 constantDelay(50, 100)
             }
@@ -108,83 +132,91 @@ fun Route.discordLogin(client: HttpClient) {
 
     authenticate("discord") {
         get<DiscordLogin> { req ->
-            val data = call.getDiscordData()
+            discordLoginSlots.withPermit {
+                val data = call.getDiscordData()
 
-            val avatarLocal = data.avatar?.let { discordHelper.downloadDiscordAvatar(it, data.id) }
+                val avatarLocal = data.avatar?.let { discordHelper.downloadDiscordAvatar(it, data.id) }
 
-            val (user, alertCount) = transaction {
-                val userId = User.upsert(User.discordId) {
-                    it[name] = data.username
-                    it[discordId] = data.id
-                    it[avatar] = avatarLocal
-                    it[active] = true
-                }.value
+                val (user, alertCount) = transaction {
+                    modelPostgresOperation()
+                    val userId = User.upsert(User.discordId) {
+                        it[name] = data.username
+                        it[discordId] = data.id
+                        it[avatar] = avatarLocal
+                        it[active] = true
+                    }.value
 
-                UserDao[userId] to alertCount(userId)
-            }
+                    UserDao[userId] to alertCount(userId)
+                }
 
-            call.sessions.set(Session.fromUser(user, alertCount, call = call))
-            call.pub("beatmaps", "user.${user.id.value}.updated.active", null, user.id.value)
-            req.state?.let { String(hex(it)) }.orEmpty().let { query ->
-                if (query.isNotEmpty() && query.contains("client_id")) {
-                    call.respondRedirect("/oauth2/authorize/success$query")
-                } else if (query.isNotEmpty() && query.contains("code")) {
-                    call.respondRedirect("/quest$query")
-                } else {
-                    call.respondRedirect("/")
+                call.sessions.set(Session.fromUser(user, alertCount, call = call))
+                modelRabbitMqOperation()
+                call.pub("beatmaps", "user.${user.id.value}.updated.active", null, user.id.value)
+                req.state?.let { String(hex(it)) }.orEmpty().let { query ->
+                    if (query.isNotEmpty() && query.contains("client_id")) {
+                        call.respondRedirect("/oauth2/authorize/success$query")
+                    } else if (query.isNotEmpty() && query.contains("code")) {
+                        call.respondRedirect("/quest$query")
+                    } else {
+                        call.respondRedirect("/")
+                    }
                 }
             }
         }
 
         get("/discord-link") {
-            requireAuthorization { _, sess ->
-                val data = call.getDiscordData()
+            discordLinkSlots.withPermit {
+                requireAuthorization { _, sess ->
+                    val data = call.getDiscordData()
 
-                newSuspendedTransaction {
-                    val (existingMaps, dualAccount) = User
-                        .join(Beatmap, JoinType.LEFT, User.id, Beatmap.uploader) {
-                            Beatmap.deletedAt.isNull()
-                        }
-                        .select(User.discordId, User.email, Beatmap.id.count())
-                        .where {
-                            (User.discordId eq data.id) and User.active
-                        }
-                        .groupBy(User.id)
-                        .firstOrNull()?.let {
-                            it[Beatmap.id.count()] to (it[User.email] != null)
-                        } ?: (0L to null)
+                    newSuspendedTransaction {
+                        modelPostgresOperation()
+                        val (existingMaps, dualAccount) = User
+                            .join(Beatmap, JoinType.LEFT, User.id, Beatmap.uploader) {
+                                Beatmap.deletedAt.isNull()
+                            }
+                            .select(User.discordId, User.email, Beatmap.id.count())
+                            .where {
+                                (User.discordId eq data.id) and User.active
+                            }
+                            .groupBy(User.id)
+                            .firstOrNull()?.let {
+                                it[Beatmap.id.count()] to (it[User.email] != null)
+                            } ?: (0L to null)
 
-                    val deadUserId = if (existingMaps > 0 || dualAccount == true) {
-                        // User has maps, can't link
-                        return@newSuspendedTransaction null
-                    } else if (dualAccount == false) {
-                        // Email = false means the other account is a pure discord account
-                        // and as it has no maps we can set it to inactive before linking it to the current account
-                        User.updateReturning({ User.discordId eq data.id }, {
-                            it[active] = false
-                            it[discordId] = null
+                        val deadUserId = if (existingMaps > 0 || dualAccount == true) {
+                            // User has maps, can't link
+                            return@newSuspendedTransaction null
+                        } else if (dualAccount == false) {
+                            // Email = false means the other account is a pure discord account
+                            // and as it has no maps we can set it to inactive before linking it to the current account
+                            User.updateReturning({ User.discordId eq data.id }, {
+                                it[active] = false
+                                it[discordId] = null
+                                it[updatedAt] = NowExpression(updatedAt)
+                            }, User.id)?.singleOrNull()?.let { row ->
+                                row[User.id].value
+                            }
+                        } else {
+                            null
+                        }
+
+                        val avatarLocal = data.avatar?.let { discordHelper.downloadDiscordAvatar(it, data.id) }
+
+                        User.update({ User.id eq sess.userId }) {
+                            it[discordId] = data.id
+                            it[avatar] = avatarLocal
                             it[updatedAt] = NowExpression(updatedAt)
-                        }, User.id)?.singleOrNull()?.let { row ->
-                            row[User.id].value
                         }
-                    } else {
-                        null
+
+                        deadUserId
+                    }?.let { userId ->
+                        modelRabbitMqOperation()
+                        call.pub("beatmaps", "user.$userId.updated.active", null, userId)
                     }
 
-                    val avatarLocal = data.avatar?.let { discordHelper.downloadDiscordAvatar(it, data.id) }
-
-                    User.update({ User.id eq sess.userId }) {
-                        it[discordId] = data.id
-                        it[avatar] = avatarLocal
-                        it[updatedAt] = NowExpression(updatedAt)
-                    }
-
-                    deadUserId
-                }?.let { userId ->
-                    call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                    call.respondRedirect("/profile#account")
                 }
-
-                call.respondRedirect("/profile#account")
             }
         }
     }

@@ -18,6 +18,7 @@ fun updateAlertCount(rb: RabbitMQInstance?, userId: Int) {
     if (rb == null) return
 
     TransactionManager.currentOrNull()?.commit()
+    modelRabbitMqOperation()
     rb.publish("beatmaps", "user.alerts.$userId", null, userId)
 }
 
@@ -29,6 +30,7 @@ fun Application.alertsThread() {
     rabbitOptional {
         consumeAck("bm.alertCount", Int.serializer()) { _, userId ->
             val alertCount = transaction {
+                modelPostgresOperation()
                 alertCount(userId)
             }
 

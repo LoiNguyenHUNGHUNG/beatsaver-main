@@ -3,6 +3,7 @@ package io.beatmaps.util
 import io.beatmaps.cloudflare.CaptchaVerifier
 import io.beatmaps.common.json
 import io.beatmaps.controllers.UploadException
+import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
 import io.ktor.client.HttpClient
 import io.ktor.http.content.MultiPartData
 import io.ktor.http.content.PartData
@@ -22,6 +23,7 @@ data class MultipartRequest<U>(val dataMap: Map<String, JsonElement> = emptyMap(
     fun validRecaptcha(authType: AuthType) = authType == AuthType.Oauth || recaptchaSuccess
 }
 
+@BandwidthEffect(rMaxBytesPerSecond = SMALL_RESPONSE_RATE_BYTES_PER_SECOND, nMax = 1)
 private suspend fun <U> handleMultipartInternal(data: MultiPartData, ctx: RoutingContext, client: HttpClient, cb: suspend (PartData.FileItem) -> U): MultipartRequest<U> {
     val part = data.readPart()
 

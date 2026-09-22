@@ -36,8 +36,11 @@ import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.controllers.userWipCount
 import io.beatmaps.util.GameTokenValidator
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.captchaIfPresent
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.beatmaps.util.optionalAuthorization
 import io.beatmaps.util.publishVersion
 import io.beatmaps.util.requireAuthorization
@@ -50,6 +53,8 @@ import io.ktor.server.resources.post
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.RoutingContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.toJavaInstant
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.Serializable
@@ -145,6 +150,7 @@ data class OculusAuthResponse(val success: Boolean, val error: String? = null)
 const val beatsaberAppid = 620980
 
 fun RoutingContext.getTestplayQueue(userId: Int?, includePlayed: Boolean, page: Long?) = transaction {
+    modelPostgresOperation()
     Beatmap
         .joinVersions(true) { Versions.state eq EMapState.Testplay }
         .joinUploader()
@@ -181,6 +187,7 @@ fun RoutingContext.getTestplayQueue(userId: Int?, includePlayed: Boolean, page: 
 }
 
 fun RoutingContext.getTestplayRecent(userId: Int, page: Long?) = transaction {
+    modelPostgresOperation()
     // Maybe a little bit cross-product, but not made worse by testplay info as only info from the current user is included
     // Beatmaps get grouped by complexToBeatmap and clients need to reconstruct the ordering
     Testplay
@@ -202,6 +209,9 @@ fun RoutingContext.getTestplayRecent(userId: Int, page: Long?) = transaction {
             MapDetail.from(it, cdnPrefix())
         }
 }
+
+private val tokenVerificationSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val testplayFeedbackSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Route.testplayRoute(client: HttpClient) {
     post<TestplayApi.Queue> { req ->
@@ -235,6 +245,7 @@ fun Route.testplayRoute(client: HttpClient) {
             }
 
             val valid = transaction {
+                modelPostgresOperation()
                 val user = UserDao.wrapRow(
                     User.joinPatreon().selectAll().where { User.id eq sess.userId }.handlePatreon().first()
                 )
@@ -285,6 +296,8 @@ fun Route.testplayRoute(client: HttpClient) {
 
             valid || throw ServerApiException("Error updating map state")
 
+            modelRabbitMqOperation()
+
             call.pub("beatmaps", "maps.${newState.mapId}.updated.state", null, newState.mapId)
             call.respond(HttpStatusCode.OK, ActionResponse.success())
         }
@@ -295,6 +308,7 @@ fun Route.testplayRoute(client: HttpClient) {
             val update = call.receive<FeedbackUpdate>()
 
             val valid = transaction {
+                modelPostgresOperation()
                 Versions.join(Beatmap, JoinType.INNER, onColumn = Versions.mapId, otherColumn = Beatmap.id).update({
                     (Versions.hash eq update.hash) and (Beatmap.uploader eq sess.userId)
                 }) {
@@ -308,21 +322,23 @@ fun Route.testplayRoute(client: HttpClient) {
 
     val validator = GameTokenValidator(client)
     post<MapsApi.Verify, AuthRequest>("Verify user tokens".responds(ok<ActionResponse>())) { _, auth ->
-        call.respond(
-            auth.steamId?.let { steamId ->
-                if (!validator.steam(steamId, auth.proof)) {
-                    ActionResponse.error("Could not validate steam token")
-                } else {
-                    ActionResponse.success()
-                }
-            } ?: auth.oculusId?.let { oculusId ->
-                if (!validator.oculus(oculusId, auth.proof)) {
-                    ActionResponse.error("Could not validate oculus token")
-                } else {
-                    ActionResponse.success()
-                }
-            } ?: ActionResponse.error("No user identifier provided")
-        )
+        tokenVerificationSlots.withPermit {
+            call.respond(
+                auth.steamId?.let { steamId ->
+                    if (!validator.steam(steamId, auth.proof)) {
+                        ActionResponse.error("Could not validate steam token")
+                    } else {
+                        ActionResponse.success()
+                    }
+                } ?: auth.oculusId?.let { oculusId ->
+                    if (!validator.oculus(oculusId, auth.proof)) {
+                        ActionResponse.error("Could not validate oculus token")
+                    } else {
+                        ActionResponse.success()
+                    }
+                } ?: ActionResponse.error("No user identifier provided")
+            )
+        }
     }
 
     post<TestplayApi.Mark> {
@@ -330,6 +346,7 @@ fun Route.testplayRoute(client: HttpClient) {
             val mark = call.receive<MarkRequest>()
 
             transaction {
+                modelPostgresOperation()
                 val versionIdVal = if ((mark.removeFromQueue || mark.addToQueue) && sess.testplay) {
                     val urResult = Versions.updateReturning(
                         {
@@ -370,26 +387,29 @@ fun Route.testplayRoute(client: HttpClient) {
         requireAuthorization(OauthScope.TESTPLAY) { _, sess ->
             val update = call.receive<FeedbackUpdate>()
 
-            captchaIfPresent(client, update.captcha) {
-                transaction {
-                    val subQuery = Versions.select(Versions.id).where { Versions.hash eq update.hash }
+            testplayFeedbackSlots.withPermit {
+                captchaIfPresent(client, update.captcha) {
+                    transaction {
+                        modelPostgresOperation()
+                        val subQuery = Versions.select(Versions.id).where { Versions.hash eq update.hash }
 
-                    if (update.captcha == null) {
-                        Testplay.update({ (Testplay.versionId eq wrapAsExpressionNotNull(subQuery)) and (Testplay.userId eq sess.userId) }) { t ->
-                            t[feedbackAt] = NowExpression(feedbackAt)
-                            t[feedback] = update.feedback
-                        }
-                    } else {
-                        Testplay.upsert(conflictIndex = Index(listOf(Testplay.versionId, Testplay.userId), true, "user_version_unique")) { t ->
-                            t[versionId] = wrapAsExpressionNotNull<Int>(subQuery)
-                            t[userId] = sess.userId
-                            t[feedbackAt] = NowExpression(feedbackAt)
-                            t[feedback] = update.feedback
+                        if (update.captcha == null) {
+                            Testplay.update({ (Testplay.versionId eq wrapAsExpressionNotNull(subQuery)) and (Testplay.userId eq sess.userId) }) { t ->
+                                t[feedbackAt] = NowExpression(feedbackAt)
+                                t[feedback] = update.feedback
+                            }
+                        } else {
+                            Testplay.upsert(conflictIndex = Index(listOf(Testplay.versionId, Testplay.userId), true, "user_version_unique")) { t ->
+                                t[versionId] = wrapAsExpressionNotNull<Int>(subQuery)
+                                t[userId] = sess.userId
+                                t[feedbackAt] = NowExpression(feedbackAt)
+                                t[feedback] = update.feedback
+                            }
                         }
                     }
-                }
 
-                call.respond(HttpStatusCode.OK)
+                    call.respond(HttpStatusCode.OK)
+                }
             }
         }
     }

@@ -7,6 +7,7 @@ import io.beatmaps.common.dbo.OauthClientDao
 import io.beatmaps.common.dbo.RefreshTokenTable
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
+import io.beatmaps.util.modelPostgresOperation
 import nl.myndocs.oauth2.identity.Identity
 import nl.myndocs.oauth2.identity.TokenInfo
 import nl.myndocs.oauth2.token.AccessToken
@@ -29,6 +30,7 @@ object DBTokenStore : TokenStore {
 
     override fun accessToken(token: String) =
         transaction {
+            modelPostgresOperation()
             AccessTokenTable
                 .join(RefreshTokenTable, JoinType.INNER, AccessTokenTable.refreshToken, RefreshTokenTable.id)
                 .join(OauthClient, JoinType.INNER, AccessTokenTable.clientId, OauthClient.clientId)
@@ -69,6 +71,7 @@ object DBTokenStore : TokenStore {
 
     override fun refreshToken(token: String) =
         transaction {
+            modelPostgresOperation()
             RefreshTokenTable
                 .join(User, JoinType.INNER, RefreshTokenTable.userName, User.id)
                 .selectAll()
@@ -89,6 +92,7 @@ object DBTokenStore : TokenStore {
 
     override fun revokeAccessToken(token: String) {
         transaction {
+            modelPostgresOperation()
             AccessTokenTable.deleteWhere {
                 id eq token
             }
@@ -97,6 +101,7 @@ object DBTokenStore : TokenStore {
 
     override fun revokeRefreshToken(token: String) {
         transaction {
+            modelPostgresOperation()
             RefreshTokenTable.deleteWhere {
                 id eq token
             }
@@ -105,6 +110,7 @@ object DBTokenStore : TokenStore {
 
     override fun storeAccessToken(accessToken: AccessToken) {
         transaction {
+            modelPostgresOperation()
             AccessTokenTable.insert {
                 it[id] = accessToken.accessToken
                 it[type] = accessToken.tokenType
@@ -129,6 +135,7 @@ object DBTokenStore : TokenStore {
 
     override fun storeRefreshToken(refreshToken: RefreshToken) {
         transaction {
+            modelPostgresOperation()
             RefreshTokenTable.upsert(RefreshTokenTable.id) {
                 it[id] = refreshToken.refreshToken
                 it[expiration] = refreshToken.expireTime
@@ -141,6 +148,7 @@ object DBTokenStore : TokenStore {
 
     override fun tokenInfo(token: String) =
         transaction {
+            modelPostgresOperation()
             AccessTokenTable
                 .join(RefreshTokenTable, JoinType.INNER, AccessTokenTable.refreshToken, RefreshTokenTable.id)
                 .join(OauthClient, JoinType.INNER, AccessTokenTable.clientId, OauthClient.clientId)
@@ -162,6 +170,7 @@ object DBTokenStore : TokenStore {
 
     fun deleteForUser(userId: Int) {
         transaction {
+            modelPostgresOperation()
             AccessTokenTable
                 .deleteWhere {
                     userName eq userId

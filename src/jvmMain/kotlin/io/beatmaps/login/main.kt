@@ -9,10 +9,17 @@ import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.common.getCountry
 import io.beatmaps.genericPage
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
+import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
+import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.jsonwebtoken.JwtException
 import io.jsonwebtoken.Jwts
 import io.jsonwebtoken.security.SignatureException
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.URLBuilder
@@ -36,6 +43,8 @@ import io.ktor.server.sessions.get
 import io.ktor.server.sessions.sessions
 import io.ktor.server.sessions.set
 import io.ktor.util.StringValues
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.sql.and
@@ -137,6 +146,29 @@ class Username
 @Resource("/steam")
 class Steam
 
+private val steamLoginSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
+@NetworkDownload(
+    maxBytes = SMALL_RESPONSE_MAX_BYTES,
+    completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+)
+private suspend fun validateSteamOpenId(client: HttpClient, queryParams: StringValues) =
+    client.submitForm(
+        "https://steamcommunity.com/openid/login",
+        formParameters = parametersOf(
+            "openid.ns" to listOf("http://specs.openid.net/auth/2.0"),
+            "openid.mode" to listOf("check_authentication"),
+            "openid.sig" to listOf(queryParams["openid.sig"] ?: ""),
+            *queryParams["openid.signed"]?.split(",")?.map {
+                "openid.$it" to listOf(queryParams["openid.$it"] ?: "")
+            }?.toTypedArray() ?: arrayOf()
+        )
+    ) {
+        timeout {
+            requestTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+        }
+    }.bodyAsText()
+
 fun Route.authRoute(client: HttpClient) {
     get<Register> { genericPage() }
     get<Forgot> { genericPage() }
@@ -152,6 +184,7 @@ fun Route.authRoute(client: HttpClient) {
 
             trusted.body.subject.toInt().let { userId ->
                 transaction {
+                    modelPostgresOperation()
                     User.update({
                         (User.id eq userId) and User.verifyToken.isNotNull()
                     }) {
@@ -160,7 +193,10 @@ fun Route.authRoute(client: HttpClient) {
                         it[updatedAt] = NowExpression(updatedAt)
                     } > 0
                 }.also {
-                    if (it) call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                    if (it) {
+                        modelRabbitMqOperation()
+                        call.pub("beatmaps", "user.$userId.updated.active", null, userId)
+                    }
                 }
             }
         } catch (e: SignatureException) {
@@ -261,17 +297,9 @@ fun Route.authRoute(client: HttpClient) {
             // val url = Url(URLProtocol.HTTPS, "steamcommunity.com", 0, "/openid/login", params, "", null, null, false).toString()
             call.respondRedirect(url)
         } else {
-            val xml = client.submitForm(
-                "https://steamcommunity.com/openid/login",
-                formParameters = parametersOf(
-                    "openid.ns" to listOf("http://specs.openid.net/auth/2.0"),
-                    "openid.mode" to listOf("check_authentication"),
-                    "openid.sig" to listOf(queryParams["openid.sig"] ?: ""),
-                    *queryParams["openid.signed"]?.split(",")?.map {
-                        "openid.$it" to listOf(queryParams["openid.$it"] ?: "")
-                    }?.toTypedArray() ?: arrayOf()
-                )
-            ).bodyAsText()
+            val xml = steamLoginSlots.withPermit {
+                validateSteamOpenId(client, queryParams)
+            }
             val valid = Regex("is_valid\\s*:\\s*true", RegexOption.IGNORE_CASE).containsMatchIn(xml)
             if (!valid) {
                 throw RuntimeException("Invalid openid response 1")
@@ -282,6 +310,7 @@ fun Route.authRoute(client: HttpClient) {
             val steamid = matches[1].toLong()
 
             transaction {
+                modelPostgresOperation()
                 User.update({ User.id eq sess.userId }) {
                     it[steamId] = steamid
                     it[updatedAt] = NowExpression(updatedAt)

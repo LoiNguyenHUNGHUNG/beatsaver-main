@@ -15,9 +15,12 @@ import io.beatmaps.common.beatsaber.leaderboard.SSGameMode
 import io.beatmaps.common.or
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.ktor.resources.Resource
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.UseSerializers
 
 @Resource("/api/scores")
@@ -44,6 +47,8 @@ class ScoresApi {
     }
 }
 
+private val scoresHandlerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun Route.scoresRoute() {
     val lookup = mapOf(
         LeaderboardType.ScoreSaber to ScoreSaberScores(scoresClient),
@@ -51,12 +56,14 @@ fun Route.scoresRoute() {
     )
 
     getWithOptions<ScoresApi.Leaderboard> {
-        val response = lookup[it.type.or(LeaderboardType.ScoreSaber)]?.getLeaderboard(
-            it.key,
-            EDifficulty.fromInt(it.difficulty.or(-1)) ?: EDifficulty.ExpertPlus,
-            SSGameMode.fromInt(it.gameMode.or(-1)) ?: SSGameMode.SoloStandard,
-            it.page.or(1)
-        ) ?: throw UserApiException("Unknown leaderboard")
+        val response = scoresHandlerSlots.withPermit {
+            lookup[it.type.or(LeaderboardType.ScoreSaber)]?.getLeaderboard(
+                it.key,
+                EDifficulty.fromInt(it.difficulty.or(-1)) ?: EDifficulty.ExpertPlus,
+                SSGameMode.fromInt(it.gameMode.or(-1)) ?: SSGameMode.SoloStandard,
+                it.page.or(1)
+            ) ?: throw UserApiException("Unknown leaderboard")
+        }
 
         call.respond(response)
     }

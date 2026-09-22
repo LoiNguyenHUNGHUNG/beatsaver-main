@@ -32,12 +32,18 @@ import io.beatmaps.common.tag
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.util.GameTokenValidator
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
+import io.beatmaps.util.modelSolrOperation
 import io.ktor.client.HttpClient
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.application
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.datetime.toJavaInstant
@@ -95,10 +101,13 @@ data class QueuedVote(val userId: Long, val steam: Boolean, val mapId: Int, val 
 @Serializable
 data class VoteSummary(val hash: String?, val mapId: Int, val key64: String?, val upvotes: Int, val downvotes: Int, val score: Double)
 
+private val voteValidationSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun Route.voteRoute(client: HttpClient) {
     application.rabbitOptional {
         consumeAck("vote", QueuedVote::class) { _, body ->
             transaction {
+                modelPostgresOperation()
                 Votes.upsert(conflictIndex = Index(listOf(Votes.mapId, Votes.userId, Votes.steam), true, "vote_unique")) {
                     it[mapId] = body.mapId
                     it[userId] = body.userId
@@ -133,6 +142,7 @@ fun Route.voteRoute(client: HttpClient) {
                     val mapDeleted = row[Beatmap.deletedAt] != null
                     if (!mapDeleted) {
                         try {
+                            modelSolrOperation()
                             BsSolr.insert {
                                 it[mapId] = toHexString(body.mapId)
                                 it.update(voteScore, scoreWeighted.toFloat())
@@ -146,23 +156,28 @@ fun Route.voteRoute(client: HttpClient) {
                     row[Beatmap.uploader].value
                 }
             }?.let { uploader ->
+                modelRabbitMqOperation()
                 publish("beatmaps", "user.stats.$uploader", null, uploader)
+                modelRabbitMqOperation()
                 publish("beatmaps", "voteupdate.${body.mapId}", null, body.mapId)
             }
         }
 
         consumeAck("maptouv", Int.serializer()) { _, mapId ->
             transaction {
+                modelPostgresOperation()
                 Beatmap.select(Beatmap.uploader).where {
                     Beatmap.id eq mapId
                 }.firstOrNull()?.let { it[Beatmap.uploader].value }
             }?.let {
+                modelRabbitMqOperation()
                 publish("beatmaps", "user.stats.$it", null, it)
             }
         }
 
         consumeAck("uvstats", Int.serializer()) { _, body ->
             transaction {
+                modelPostgresOperation()
                 val subQuery = Beatmap
                     .joinVersions()
                     .select(coalesce(Beatmap.upVotesInt.sum(), intLiteral(0)).alias("votes"))
@@ -182,6 +197,7 @@ fun Route.voteRoute(client: HttpClient) {
 
     getWithOptions<VoteApi.Since>("Get votes".responds(ok<List<VoteSummary>>(), notFound())) { req ->
         val voteSummary = transaction {
+            modelPostgresOperation()
             val updatedMaps =
                 Beatmap.joinVersions(false).selectAll().where {
                     Beatmap.lastVoteAt greaterEq (req.since.or(Clock.System.now())).toJavaInstant()
@@ -208,39 +224,43 @@ fun Route.voteRoute(client: HttpClient) {
     postWithOptions<VoteApi.Vote, VoteRequest>("Vote on a map".responds(ok<ActionResponse>())) { _, req ->
         call.tag("platform", if (req.auth.steamId != null) "steam" else if (req.auth.oculusId != null) "oculus" else "unknown")
 
-        newSuspendedTransaction {
-            try {
-                val mapIdRow = Versions.select(Versions.mapId).where {
-                    Versions.hash eq req.hash.lowercase()
-                }.limit(1).singleOrNull()
+        voteValidationSlots.withPermit {
+            newSuspendedTransaction {
+                modelPostgresOperation()
+                try {
+                    val mapIdRow = Versions.select(Versions.mapId).where {
+                        Versions.hash eq req.hash.lowercase()
+                    }.limit(1).singleOrNull()
 
-                if (mapIdRow == null) {
-                    call.respond(HttpStatusCode.NotFound)
-                    return@newSuspendedTransaction
+                    if (mapIdRow == null) {
+                        call.respond(HttpStatusCode.NotFound)
+                        return@newSuspendedTransaction
+                    }
+
+                    val (userId, steam) = req.auth.steamId?.let { steamId ->
+                        if (!validator.steam(steamId, req.auth.proof)) {
+                            error("Could not validate steam token")
+                        }
+
+                        // Valid steam user
+                        steamId.toLong() to true
+                    } ?: req.auth.oculusId?.let { oculusId ->
+                        if (!validator.oculus(oculusId, req.auth.proof)) {
+                            error("Could not validate oculus token")
+                        }
+
+                        // Valid oculus user
+                        oculusId.toLong() to false
+                    } ?: error("No user identifier provided")
+
+                    val mapId = mapIdRow[Versions.mapId]
+                    modelRabbitMqOperation()
+                    call.pub("beatmaps", "vote.$mapId", null, QueuedVote(userId, steam, mapId.value, req.direction))
+
+                    call.respond(ActionResponse.success())
+                } catch (e: IllegalStateException) {
+                    call.respond(HttpStatusCode.BadRequest, ActionResponse.error(e.message ?: "Unknown error"))
                 }
-
-                val (userId, steam) = req.auth.steamId?.let { steamId ->
-                    if (!validator.steam(steamId, req.auth.proof)) {
-                        error("Could not validate steam token")
-                    }
-
-                    // Valid steam user
-                    steamId.toLong() to true
-                } ?: req.auth.oculusId?.let { oculusId ->
-                    if (!validator.oculus(oculusId, req.auth.proof)) {
-                        error("Could not validate oculus token")
-                    }
-
-                    // Valid oculus user
-                    oculusId.toLong() to false
-                } ?: error("No user identifier provided")
-
-                val mapId = mapIdRow[Versions.mapId]
-                call.pub("beatmaps", "vote.$mapId", null, QueuedVote(userId, steam, mapId.value, req.direction))
-
-                call.respond(ActionResponse.success())
-            } catch (e: IllegalStateException) {
-                call.respond(HttpStatusCode.BadRequest, ActionResponse.error(e.message ?: "Unknown error"))
             }
         }
     }

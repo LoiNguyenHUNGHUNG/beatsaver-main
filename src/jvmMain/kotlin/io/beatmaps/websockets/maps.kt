@@ -11,6 +11,8 @@ import io.beatmaps.common.dbo.joinUploader
 import io.beatmaps.common.dbo.joinVersions
 import io.beatmaps.common.json
 import io.beatmaps.common.util.CDNUpdate
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelRabbitMqOperation
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.application
 import kotlinx.serialization.Serializable
@@ -33,6 +35,7 @@ fun Route.mapUpdateEnricher() {
     application.rabbitOptional {
         consumeAck("bm.updateStream", Int.serializer()) { _, mapId ->
             transaction {
+                modelPostgresOperation()
                 Beatmap
                     .joinVersions(true, state = null)
                     .joinUploader()
@@ -50,6 +53,8 @@ fun Route.mapUpdateEnricher() {
                 val updatedVersion = publishedVersion ?: map.second.latestVersion()
                 val cdnUpdate = CDNUpdate(updatedVersion?.hash, map.second.intId(), publishedVersion != null, map.second.metadata.songName, map.second.metadata.levelAuthorName, map.first != null)
 
+                modelRabbitMqOperation()
+
                 publish("beatmaps", "cdn.${cdnUpdate.mapId}", null, cdnUpdate)
 
                 val wsMsg = if (map.first == null) {
@@ -59,6 +64,8 @@ fun Route.mapUpdateEnricher() {
                     val subJson = json.encodeToJsonElement(toHexString(mapId))
                     MapUpdateMessage(MapUpdateMessageType.MAP_DELETE, subJson)
                 }
+
+                modelRabbitMqOperation()
 
                 publish("beatmaps", "ws.map.$mapId", null, wsMsg)
             }

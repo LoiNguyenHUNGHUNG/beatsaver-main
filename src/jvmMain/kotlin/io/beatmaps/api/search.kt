@@ -57,6 +57,8 @@ import io.beatmaps.common.util.applyToQuery
 import io.beatmaps.common.util.paramInfo
 import io.beatmaps.common.util.requireParams
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelSolrOperation
 import io.beatmaps.util.optionalAuthorization
 import io.ktor.resources.Resource
 import io.ktor.server.plugins.origin
@@ -296,6 +298,7 @@ fun Route.searchRoute() {
             val actualSortOrder = searchInfo.validateSearchOrder(it.order.or(it.sortOrder.or(SearchOrder.Relevance)))
 
             newSuspendedTransaction {
+                modelPostgresOperation()
                 if (searchInfo.checkKeySearch(call)) return@newSuspendedTransaction
 
                 val followingSubQuery = if (user != null && it.followed == true) {
@@ -400,6 +403,7 @@ fun Route.searchRoute() {
                         BsSolr.addSortArgs(q, it.seed.hashCode(), actualSortOrder, it.ascending ?: false)
                     }
                     .paged(page = it.page.or(0).toInt(), pageSize = it.pageSize.or(20).coerceIn(1, 100))
+                    .also { modelSolrOperation() }
                     .getIds(BsSolr, call = call)
 
                 val beatmaps = Beatmap
@@ -432,6 +436,7 @@ fun Route.searchRoute() {
             val sortArgs = searchInfo.sortArgsFor(actualSortOrder)
 
             newSuspendedTransaction {
+                modelPostgresOperation()
                 val followingSubQuery = if (user != null && it.followed == true) {
                     Follows
                         .select(Follows.userId)

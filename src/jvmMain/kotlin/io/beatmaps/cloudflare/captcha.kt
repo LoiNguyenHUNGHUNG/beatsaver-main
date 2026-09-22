@@ -2,8 +2,12 @@ package io.beatmaps.cloudflare
 
 import io.beatmaps.api.ActionResponse
 import io.beatmaps.login.bmSessionId
+import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
+import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.forms.submitForm
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.parameters
@@ -96,6 +100,10 @@ object CaptchaVerifier {
     }
     fun enabled(provider: CaptchaProvider) = secrets[provider]?.let { provider.enabled(it) } ?: false
 
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun verify(client: HttpClient, provider: CaptchaProvider, gRecaptchaResponse: String, remoteIp: String) =
         if (provider == CaptchaProvider.Fake) {
             logger.warning("ReCAPTCHA not setup. Allowing request anyway")
@@ -110,6 +118,9 @@ object CaptchaVerifier {
                     append("remoteip", remoteIp)
                 }
             ) {
+                timeout {
+                    requestTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+                }
                 userAgent(provider.userAgent)
             }.let {
                 if (it.status == HttpStatusCode.OK) {

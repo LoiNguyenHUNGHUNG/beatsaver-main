@@ -21,6 +21,7 @@ class CheckScheduled(private val rb: RabbitMQInstance) : TimerTask() {
     override fun run() {
         try {
             transaction {
+                modelPostgresOperation()
                 VersionsDao.wrapRows(
                     Versions.selectAll().where {
                         Versions.state eq EMapState.Scheduled and (Versions.scheduledAt lessEq NowExpression(Versions.scheduledAt))
@@ -30,6 +31,7 @@ class CheckScheduled(private val rb: RabbitMQInstance) : TimerTask() {
                     if (publishVersion(it.mapId.value, it.hash, true, rb)) it else null
                 }
             }.forEach {
+                modelRabbitMqOperation()
                 rb.publish("beatmaps", "maps.${it.mapId.value}.updated.state", null, it.mapId.value)
             }
         } catch (e: Exception) {

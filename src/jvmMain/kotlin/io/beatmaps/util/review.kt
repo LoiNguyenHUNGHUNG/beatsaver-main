@@ -30,13 +30,17 @@ import io.beatmaps.common.dbo.joinUser
 import io.beatmaps.common.dbo.joinVersions
 import io.beatmaps.common.dbo.reviewerAlias
 import io.beatmaps.common.util.TextHelper
+import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.http.userAgent
 import io.ktor.server.application.Application
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.sql.ExpressionWithColumnType
@@ -107,14 +111,25 @@ val discordWebhookUrl: String? = System.getenv("DISCORD_WEBHOOK_URL")
 val discordReplyWebhookUrl: String? = System.getenv("DISCORD_REPLY_WEBHOOK_URL")
 val discordIssueWebhookUrl: String? = System.getenv("DISCORD_ISSUE_WEBHOOK_URL")
 
+private val reviewWebhookSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val replyWebhookSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val issueWebhookSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 class DiscordWebhookHandler(private val client: HttpClient, private val webhookUrl: String) {
     companion object {
         private const val MAX_TITLE_LEN = 100 // 256 max
         private const val MAX_REVIEW_LEN = 1024 // 1024 max
     }
 
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun post(review: ReviewDetail) {
         client.post(webhookUrl) {
+            timeout {
+                requestTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+            }
             contentType(ContentType.Application.Json)
             userAgent("BeatSaver")
 
@@ -155,10 +170,17 @@ class DiscordWebhookHandler(private val client: HttpClient, private val webhookU
         }
     }
 
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun postReply(review: ReviewDetail) {
         val reply = review.replies.singleOrNull()
 
         client.post(webhookUrl) {
+            timeout {
+                requestTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+            }
             contentType(ContentType.Application.Json)
             userAgent("BeatSaver")
 
@@ -194,8 +216,15 @@ class DiscordWebhookHandler(private val client: HttpClient, private val webhookU
         }
     }
 
+    @NetworkDownload(
+        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+    )
     suspend fun post(issue: IssueDetail, comment: IssueCommentDetail) {
         client.post(webhookUrl) {
+            timeout {
+                requestTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
+            }
             contentType(ContentType.Application.Json)
             userAgent("BeatSaver")
 
@@ -291,6 +320,7 @@ fun Application.reviewListeners(client: HttpClient) {
 
         consumeAck("bm.sentiment", ReviewUpdateInfo::class) { _, r ->
             transaction {
+                modelPostgresOperation()
                 Beatmap
                     .join(reviewSubquery, JoinType.INNER, Beatmap.id, reviewSubquery[Review.mapId])
                     .update({ Beatmap.id eq r.mapId }) {
@@ -304,6 +334,7 @@ fun Application.reviewListeners(client: HttpClient) {
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.reviewDiscordHook", ReviewUpdateInfo::class) { _, r ->
                 transaction {
+                    modelPostgresOperation()
                     Review
                         .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
                         .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
@@ -319,7 +350,9 @@ fun Application.reviewListeners(client: HttpClient) {
                             ReviewDetail.from(row, "")
                         }
                 }?.let { review ->
-                    handler.post(review)
+                    reviewWebhookSlots.withPermit {
+                        handler.post(review)
+                    }
                 }
             }
         }
@@ -328,6 +361,7 @@ fun Application.reviewListeners(client: HttpClient) {
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.replyDiscordHook", Int::class) { _, replyId ->
                 transaction {
+                    modelPostgresOperation()
                     ReviewReply
                         .join(Review, JoinType.INNER, ReviewReply.reviewId, Review.id)
                         .join(reviewerAlias, JoinType.INNER, ReviewReply.userId, reviewerAlias[User.id])
@@ -342,7 +376,9 @@ fun Application.reviewListeners(client: HttpClient) {
                             ReviewDetail.from(row, "")
                         }
                 }?.let { review ->
-                    handler.postReply(review)
+                    replyWebhookSlots.withPermit {
+                        handler.postReply(review)
+                    }
                 }
             }
         }
@@ -351,6 +387,7 @@ fun Application.reviewListeners(client: HttpClient) {
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.issuesDiscordHook", Int::class) { _, issueId ->
                 transaction {
+                    modelPostgresOperation()
                     Issue
                         .join(IssueComment, JoinType.LEFT, Issue.id, IssueComment.issueId)
                         .joinUser(Issue.creator)
@@ -366,7 +403,9 @@ fun Application.reviewListeners(client: HttpClient) {
                             IssueDetail.from(row, "") to IssueCommentDetail.from(row)
                         }
                 }?.let { (issue, comment) ->
-                    handler.post(issue, comment)
+                    issueWebhookSlots.withPermit {
+                        handler.post(issue, comment)
+                    }
                 }
             }
         }

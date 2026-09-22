@@ -54,6 +54,7 @@ fun Application.downloadsThread() {
         consumeAck("bm.downloadCount", DownloadInfo::class) { _, dl ->
             try {
                 transaction {
+                    modelPostgresOperation()
                     if (dl.type == DownloadType.HASH) {
                         Beatmap.join(Versions, JoinType.INNER, onColumn = Beatmap.id, Versions.mapId).update({ Versions.hash eq dl.hash }) {
                             it[Beatmap.downloads] = incrementBy(Beatmap.downloads, 1)

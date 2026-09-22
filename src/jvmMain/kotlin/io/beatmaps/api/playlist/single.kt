@@ -57,6 +57,8 @@ import io.beatmaps.common.util.cleanString
 import io.beatmaps.controllers.CdnSig
 import io.beatmaps.login.Session
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.modelPostgresOperation
+import io.beatmaps.util.modelSolrOperation
 import io.beatmaps.util.optionalAuthorization
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -91,6 +93,7 @@ fun Route.playlistSingle() {
         val actualSortOrder = searchInfo.validateSearchOrder(params.sortOrder)
 
         return newSuspendedTransaction {
+            modelPostgresOperation()
             val results = BsSolr.newQuery(actualSortOrder)
                 .let { q ->
                     searchInfo.applyQuery(q)
@@ -143,6 +146,7 @@ fun Route.playlistSingle() {
                     BsSolr.addSortArgs(q, playlistId, actualSortOrder, params.ascending ?: false)
                 }
                 .setStart(offset).setRows(actualPageSize)
+                .also { modelSolrOperation() }
                 .getIds(BsSolr, call = call)
 
             Beatmap
@@ -171,6 +175,7 @@ fun Route.playlistSingle() {
 
     suspend fun getDetail(id: Int, cdnPrefix: String, userId: Int?, isAdmin: Boolean, page: Long?, call: ApplicationCall): PlaylistPage? {
         val detailPage = newSuspendedTransaction {
+            modelPostgresOperation()
             val playlist = PlaylistTable
                 .joinMaps()
                 .joinUser(PlaylistTable.owner)
@@ -258,6 +263,7 @@ fun Route.playlistSingle() {
         val signed = CdnSig.verify("playlist-${req.id}", call.request)
 
         val (playlist, playlistSongs) = newSuspendedTransaction {
+            modelPostgresOperation()
             fun getPlaylist() =
                 PlaylistTable
                     .joinPlaylistCurator()
@@ -341,6 +347,7 @@ fun Route.playlistSingle() {
         val sess = call.sessions.get<Session>()
 
         transaction {
+            modelPostgresOperation()
             PlaylistTable
                 .selectAll()
                 .where {
