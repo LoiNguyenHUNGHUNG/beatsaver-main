@@ -67,6 +67,10 @@ import java.lang.Integer.toHexString
 import kotlin.math.log
 import kotlin.math.pow
 
+private val voteConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val maptouvConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val uvstatsConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 private val voteApiSinceGetSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 @Resource("/api")
@@ -108,90 +112,96 @@ private val voteValidationSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 fun Route.voteRoute(client: HttpClient) {
     application.rabbitOptional {
         consumeAck("vote", QueuedVote::class) { _, body ->
-            transaction {
-                modelPostgresOperation()
-                Votes.upsert(conflictIndex = Index(listOf(Votes.mapId, Votes.userId, Votes.steam), true, "vote_unique")) {
-                    it[mapId] = body.mapId
-                    it[userId] = body.userId
-                    it[vote] = body.direction
-                    it[updatedAt] = NowExpression(updatedAt)
-                    it[steam] = body.steam
-                }
-
-                val voteTotals = Votes.select(Count(Votes.vote), Votes.vote).where {
-                    Votes.mapId eq body.mapId
-                }.groupBy(Votes.vote).toList().associateBy({ it[Votes.vote] }, { it[Count(Votes.vote)] })
-
-                val upVotes = (voteTotals[true] ?: 0)
-                val downVotes = (voteTotals[false] ?: 0)
-                val totalVotes = (upVotes + downVotes).toDouble()
-                val rawScore = upVotes / totalVotes
-                val scoreWeighted = rawScore - (rawScore - 0.5) * 2.0.pow(-log(totalVotes / 2 + 1, 3.0))
-
-                Beatmap.updateReturning(
-                    {
-                        Beatmap.id eq body.mapId
-                    },
-                    {
-                        it[score] = scoreWeighted.toBigDecimal()
-                        it[upVotesInt] = upVotes.toInt()
-                        it[downVotesInt] = downVotes.toInt()
-                        it[lastVoteAt] = NowExpression(lastVoteAt)
-                    },
-                    Beatmap.uploader, Beatmap.deletedAt
-                )?.firstOrNull()?.let { row ->
-                    // Don't even try to update index if map is deleted
-                    val mapDeleted = row[Beatmap.deletedAt] != null
-                    if (!mapDeleted) {
-                        try {
-                            modelSolrOperation()
-                            BsSolr.insert {
-                                it[mapId] = toHexString(body.mapId)
-                                it.update(voteScore, scoreWeighted.toFloat())
-                            }
-                        } catch (ex: SolrServerException) {
-                            // This can fail when voting on maps that have been unpublished / deleted
-                            // Assume future votes / map updates will correct any inconsistency
-                        }
+            voteConsumerSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    Votes.upsert(conflictIndex = Index(listOf(Votes.mapId, Votes.userId, Votes.steam), true, "vote_unique")) {
+                        it[mapId] = body.mapId
+                        it[userId] = body.userId
+                        it[vote] = body.direction
+                        it[updatedAt] = NowExpression(updatedAt)
+                        it[steam] = body.steam
                     }
 
-                    row[Beatmap.uploader].value
+                    val voteTotals = Votes.select(Count(Votes.vote), Votes.vote).where {
+                        Votes.mapId eq body.mapId
+                    }.groupBy(Votes.vote).toList().associateBy({ it[Votes.vote] }, { it[Count(Votes.vote)] })
+
+                    val upVotes = (voteTotals[true] ?: 0)
+                    val downVotes = (voteTotals[false] ?: 0)
+                    val totalVotes = (upVotes + downVotes).toDouble()
+                    val rawScore = upVotes / totalVotes
+                    val scoreWeighted = rawScore - (rawScore - 0.5) * 2.0.pow(-log(totalVotes / 2 + 1, 3.0))
+
+                    Beatmap.updateReturning(
+                        {
+                            Beatmap.id eq body.mapId
+                        },
+                        {
+                            it[score] = scoreWeighted.toBigDecimal()
+                            it[upVotesInt] = upVotes.toInt()
+                            it[downVotesInt] = downVotes.toInt()
+                            it[lastVoteAt] = NowExpression(lastVoteAt)
+                        },
+                        Beatmap.uploader, Beatmap.deletedAt
+                    )?.firstOrNull()?.let { row ->
+                        // Don't even try to update index if map is deleted
+                        val mapDeleted = row[Beatmap.deletedAt] != null
+                        if (!mapDeleted) {
+                            try {
+                                modelSolrOperation()
+                                BsSolr.insert {
+                                    it[mapId] = toHexString(body.mapId)
+                                    it.update(voteScore, scoreWeighted.toFloat())
+                                }
+                            } catch (ex: SolrServerException) {
+                                // This can fail when voting on maps that have been unpublished / deleted
+                                // Assume future votes / map updates will correct any inconsistency
+                            }
+                        }
+
+                        row[Beatmap.uploader].value
+                    }
+                }?.let { uploader ->
+                    modelRabbitMqOperation()
+                    publish("beatmaps", "user.stats.$uploader", null, uploader)
+                    modelRabbitMqOperation()
+                    publish("beatmaps", "voteupdate.${body.mapId}", null, body.mapId)
                 }
-            }?.let { uploader ->
-                modelRabbitMqOperation()
-                publish("beatmaps", "user.stats.$uploader", null, uploader)
-                modelRabbitMqOperation()
-                publish("beatmaps", "voteupdate.${body.mapId}", null, body.mapId)
             }
         }
 
         consumeAck("maptouv", Int.serializer()) { _, mapId ->
-            transaction {
-                modelPostgresOperation()
-                Beatmap.select(Beatmap.uploader).where {
-                    Beatmap.id eq mapId
-                }.firstOrNull()?.let { it[Beatmap.uploader].value }
-            }?.let {
-                modelRabbitMqOperation()
-                publish("beatmaps", "user.stats.$it", null, it)
+            maptouvConsumerSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    Beatmap.select(Beatmap.uploader).where {
+                        Beatmap.id eq mapId
+                    }.firstOrNull()?.let { it[Beatmap.uploader].value }
+                }?.let {
+                    modelRabbitMqOperation()
+                    publish("beatmaps", "user.stats.$it", null, it)
+                }
             }
         }
 
         consumeAck("uvstats", Int.serializer()) { _, body ->
-            transaction {
-                modelPostgresOperation()
-                val subQuery = Beatmap
-                    .joinVersions()
-                    .select(coalesce(Beatmap.upVotesInt.sum(), intLiteral(0)).alias("votes"))
-                    .where {
-                        Beatmap.uploader eq body and Beatmap.deletedAt.isNull()
-                    }
+            uvstatsConsumerSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    val subQuery = Beatmap
+                        .joinVersions()
+                        .select(coalesce(Beatmap.upVotesInt.sum(), intLiteral(0)).alias("votes"))
+                        .where {
+                            Beatmap.uploader eq body and Beatmap.deletedAt.isNull()
+                        }
 
-                User.update({
-                    User.id eq body
-                }) {
-                    it[upvotes] = wrapAsExpressionNotNull(subQuery)
-                    it[statsUpdatedAt] = NowExpression(updatedAt)
+                    User.update({
+                        User.id eq body
+                    }) {
+                        it[upvotes] = wrapAsExpressionNotNull(subQuery)
+                        it[statsUpdatedAt] = NowExpression(updatedAt)
+                    }
                 }
             }
         }

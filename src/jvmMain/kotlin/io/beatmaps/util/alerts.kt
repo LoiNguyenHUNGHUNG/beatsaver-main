@@ -8,11 +8,15 @@ import io.beatmaps.login.MongoClient
 import io.beatmaps.login.Session
 import io.ktor.server.application.Application
 import io.ktor.server.routing.RoutingContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.builtins.serializer
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
 import pl.jutupe.ktor_rabbitmq.RabbitMQInstance
 import pl.jutupe.ktor_rabbitmq.publish
+
+private val bmAlertCountConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun updateAlertCount(rb: RabbitMQInstance?, userId: Int) {
     if (rb == null) return
@@ -29,12 +33,14 @@ fun RoutingContext.updateAlertCount(userId: Int) = updateAlertCount(call.rb(), u
 fun Application.alertsThread() {
     rabbitOptional {
         consumeAck("bm.alertCount", Int.serializer()) { _, userId ->
-            val alertCount = transaction {
-                modelPostgresOperation()
-                alertCount(userId)
-            }
+            bmAlertCountConsumerSlots.withPermit {
+                val alertCount = transaction {
+                    modelPostgresOperation()
+                    alertCount(userId)
+                }
 
-            MongoClient.updateSessions(userId, Session::alerts, alertCount)
+                MongoClient.updateSessions(userId, Session::alerts, alertCount)
+            }
         }
     }
 }

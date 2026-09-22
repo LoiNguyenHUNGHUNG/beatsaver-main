@@ -11,9 +11,13 @@ import io.beatmaps.common.dbo.Versions
 import io.ktor.server.application.Application
 import io.ktor.server.routing.RoutingContext
 import io.ktor.util.AttributeKey
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
+
+private val bmDownloadCountConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 val cdnPrefixes = mapOf(
     "AF" to "",
@@ -52,21 +56,23 @@ fun RoutingContext.cdnPrefix(): String {
 fun Application.downloadsThread() {
     rabbitOptional {
         consumeAck("bm.downloadCount", DownloadInfo::class) { _, dl ->
-            try {
-                transaction {
-                    modelPostgresOperation()
-                    if (dl.type == DownloadType.HASH) {
-                        Beatmap.join(Versions, JoinType.INNER, onColumn = Beatmap.id, Versions.mapId).update({ Versions.hash eq dl.hash }) {
-                            it[Beatmap.downloads] = incrementBy(Beatmap.downloads, 1)
-                        }
-                    } else {
-                        Beatmap.update({ Beatmap.id eq dl.hash.toInt(16) }) {
-                            it[downloads] = incrementBy(downloads, 1)
+            bmDownloadCountConsumerSlots.withPermit {
+                try {
+                    transaction {
+                        modelPostgresOperation()
+                        if (dl.type == DownloadType.HASH) {
+                            Beatmap.join(Versions, JoinType.INNER, onColumn = Beatmap.id, Versions.mapId).update({ Versions.hash eq dl.hash }) {
+                                it[Beatmap.downloads] = incrementBy(Beatmap.downloads, 1)
+                            }
+                        } else {
+                            Beatmap.update({ Beatmap.id eq dl.hash.toInt(16) }) {
+                                it[downloads] = incrementBy(downloads, 1)
+                            }
                         }
                     }
+                } catch (_: NumberFormatException) {
+                    // Ignore
                 }
-            } catch (_: NumberFormatException) {
-                // Ignore
             }
         }
     }

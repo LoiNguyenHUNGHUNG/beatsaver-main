@@ -65,13 +65,12 @@ to the largest configured per-download rate (8 MB / 60 seconds).
 
 The library-boundary pass exposed 109 additional effectful HTTP handlers. Each
 now has its own immutable top-level three-permit semaphore, held for the entire
-handler body. This removes all HTTP-handler repetition diagnostics. Compilation
-still intentionally stops on 31 diagnostics rather than silently assuming a
+handler body. This removes all HTTP-handler repetition diagnostics. The 16
+effectful RabbitMQ `consumeAck` callbacks likewise have independent immutable
+top-level three-permit semaphores held across their complete bodies. Compilation
+now intentionally stops on 15 diagnostics rather than silently assuming a
 bound:
 
-- 16 effectful RabbitMQ consumer callbacks need a callback concurrency model;
-  either a semaphore must be held until the callback finishes or the checker
-  must trust and understand `prefetchCount`.
 - 15 higher-order calls need effect forwarding or a calls-in-place model. These
   include `requireCaptcha`, `captchaIfPresent`, Ktor `install` and authentication
   configuration, `genericPage`, `use`, and two function references passed to
