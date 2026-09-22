@@ -11,10 +11,13 @@ import io.beatmaps.common.dbo.joinUploader
 import io.beatmaps.common.dbo.joinVersions
 import io.beatmaps.common.json
 import io.beatmaps.common.util.CDNUpdate
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelRabbitMqOperation
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.application
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.JsonElement
@@ -23,6 +26,8 @@ import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import pl.jutupe.ktor_rabbitmq.publish
 import java.lang.Integer.toHexString
+
+private val bmUpdateStreamConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 enum class MapUpdateMessageType {
     MAP_UPDATE, MAP_DELETE
@@ -34,40 +39,42 @@ data class MapUpdateMessage(val type: MapUpdateMessageType, val msg: JsonElement
 fun Route.mapUpdateEnricher() {
     application.rabbitOptional {
         consumeAck("bm.updateStream", Int.serializer()) { _, mapId ->
-            transaction {
-                modelPostgresOperation()
-                Beatmap
-                    .joinVersions(true, state = null)
-                    .joinUploader()
-                    .joinCurator()
-                    .selectAll()
-                    .where {
-                        Beatmap.id eq mapId
+            bmUpdateStreamConsumerSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    Beatmap
+                        .joinVersions(true, state = null)
+                        .joinUploader()
+                        .joinCurator()
+                        .selectAll()
+                        .where {
+                            Beatmap.id eq mapId
+                        }
+                        .complexToBeatmap()
+                        .firstOrNull()?.let {
+                            it.deletedAt to MapDetail.from(it, "")
+                        }
+                }?.let { map ->
+                    val publishedVersion = map.second.publishedVersion()
+                    val updatedVersion = publishedVersion ?: map.second.latestVersion()
+                    val cdnUpdate = CDNUpdate(updatedVersion?.hash, map.second.intId(), publishedVersion != null, map.second.metadata.songName, map.second.metadata.levelAuthorName, map.first != null)
+
+                    modelRabbitMqOperation()
+
+                    publish("beatmaps", "cdn.${cdnUpdate.mapId}", null, cdnUpdate)
+
+                    val wsMsg = if (map.first == null) {
+                        val subJson = json.encodeToJsonElement(map.second)
+                        MapUpdateMessage(MapUpdateMessageType.MAP_UPDATE, subJson)
+                    } else {
+                        val subJson = json.encodeToJsonElement(toHexString(mapId))
+                        MapUpdateMessage(MapUpdateMessageType.MAP_DELETE, subJson)
                     }
-                    .complexToBeatmap()
-                    .firstOrNull()?.let {
-                        it.deletedAt to MapDetail.from(it, "")
-                    }
-            }?.let { map ->
-                val publishedVersion = map.second.publishedVersion()
-                val updatedVersion = publishedVersion ?: map.second.latestVersion()
-                val cdnUpdate = CDNUpdate(updatedVersion?.hash, map.second.intId(), publishedVersion != null, map.second.metadata.songName, map.second.metadata.levelAuthorName, map.first != null)
 
-                modelRabbitMqOperation()
+                    modelRabbitMqOperation()
 
-                publish("beatmaps", "cdn.${cdnUpdate.mapId}", null, cdnUpdate)
-
-                val wsMsg = if (map.first == null) {
-                    val subJson = json.encodeToJsonElement(map.second)
-                    MapUpdateMessage(MapUpdateMessageType.MAP_UPDATE, subJson)
-                } else {
-                    val subJson = json.encodeToJsonElement(toHexString(mapId))
-                    MapUpdateMessage(MapUpdateMessageType.MAP_DELETE, subJson)
+                    publish("beatmaps", "ws.map.$mapId", null, wsMsg)
                 }
-
-                modelRabbitMqOperation()
-
-                publish("beatmaps", "ws.map.$mapId", null, wsMsg)
             }
         }
     }

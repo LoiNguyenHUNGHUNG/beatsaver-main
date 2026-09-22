@@ -56,6 +56,11 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import java.math.BigDecimal
 
+private val bmSentimentConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val bmReviewDiscordHookConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val bmReplyDiscordHookConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val bmIssuesDiscordHookConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 @Serializable
 data class DiscordWebhookBody(
     val content: String? = null,
@@ -319,39 +324,43 @@ fun Application.reviewListeners(client: HttpClient) {
         val reviewSubquery = Review.select(avg, count, Review.mapId).groupBy(Review.mapId).alias("r")
 
         consumeAck("bm.sentiment", ReviewUpdateInfo::class) { _, r ->
-            transaction {
-                modelPostgresOperation()
-                Beatmap
-                    .join(reviewSubquery, JoinType.INNER, Beatmap.id, reviewSubquery[Review.mapId])
-                    .update({ Beatmap.id eq r.mapId }) {
-                        it[Beatmap.sentiment] = SqlExpressionBuilder.coalesce(reviewSubquery[avg] as ExpressionWithColumnType<BigDecimal?>, decimalLiteral(BigDecimal.ZERO))
-                        it[Beatmap.reviews] = reviewSubquery[count]
-                    }
+            bmSentimentConsumerSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    Beatmap
+                        .join(reviewSubquery, JoinType.INNER, Beatmap.id, reviewSubquery[Review.mapId])
+                        .update({ Beatmap.id eq r.mapId }) {
+                            it[Beatmap.sentiment] = SqlExpressionBuilder.coalesce(reviewSubquery[avg] as ExpressionWithColumnType<BigDecimal?>, decimalLiteral(BigDecimal.ZERO))
+                            it[Beatmap.reviews] = reviewSubquery[count]
+                        }
+                }
             }
         }
 
         discordWebhookUrl?.let { webhookUrl ->
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.reviewDiscordHook", ReviewUpdateInfo::class) { _, r ->
-                transaction {
-                    modelPostgresOperation()
-                    Review
-                        .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
-                        .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                        .joinVersions()
-                        .joinUploader()
-                        .joinCurator()
-                        .selectAll()
-                        .where {
-                            Review.mapId eq r.mapId and (Review.userId eq r.userId)
+                bmReviewDiscordHookConsumerSlots.withPermit {
+                    transaction {
+                        modelPostgresOperation()
+                        Review
+                            .join(reviewerAlias, JoinType.INNER, Review.userId, reviewerAlias[User.id])
+                            .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                            .joinVersions()
+                            .joinUploader()
+                            .joinCurator()
+                            .selectAll()
+                            .where {
+                                Review.mapId eq r.mapId and (Review.userId eq r.userId)
+                            }
+                            .complexToReview()
+                            .singleOrNull()?.let { row ->
+                                ReviewDetail.from(row, "")
+                            }
+                    }?.let { review ->
+                        reviewWebhookSlots.withPermit {
+                            handler.post(review)
                         }
-                        .complexToReview()
-                        .singleOrNull()?.let { row ->
-                            ReviewDetail.from(row, "")
-                        }
-                }?.let { review ->
-                    reviewWebhookSlots.withPermit {
-                        handler.post(review)
                     }
                 }
             }
@@ -360,24 +369,26 @@ fun Application.reviewListeners(client: HttpClient) {
         discordReplyWebhookUrl?.let { webhookUrl ->
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.replyDiscordHook", Int::class) { _, replyId ->
-                transaction {
-                    modelPostgresOperation()
-                    ReviewReply
-                        .join(Review, JoinType.INNER, ReviewReply.reviewId, Review.id)
-                        .join(reviewerAlias, JoinType.INNER, ReviewReply.userId, reviewerAlias[User.id])
-                        .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
-                        .joinVersions()
-                        .selectAll()
-                        .where {
-                            ReviewReply.id eq replyId
+                bmReplyDiscordHookConsumerSlots.withPermit {
+                    transaction {
+                        modelPostgresOperation()
+                        ReviewReply
+                            .join(Review, JoinType.INNER, ReviewReply.reviewId, Review.id)
+                            .join(reviewerAlias, JoinType.INNER, ReviewReply.userId, reviewerAlias[User.id])
+                            .join(Beatmap, JoinType.INNER, Review.mapId, Beatmap.id)
+                            .joinVersions()
+                            .selectAll()
+                            .where {
+                                ReviewReply.id eq replyId
+                            }
+                            .complexToReview()
+                            .singleOrNull()?.let { row ->
+                                ReviewDetail.from(row, "")
+                            }
+                    }?.let { review ->
+                        replyWebhookSlots.withPermit {
+                            handler.postReply(review)
                         }
-                        .complexToReview()
-                        .singleOrNull()?.let { row ->
-                            ReviewDetail.from(row, "")
-                        }
-                }?.let { review ->
-                    replyWebhookSlots.withPermit {
-                        handler.postReply(review)
                     }
                 }
             }
@@ -386,25 +397,27 @@ fun Application.reviewListeners(client: HttpClient) {
         discordIssueWebhookUrl?.let { webhookUrl ->
             val handler = DiscordWebhookHandler(client, webhookUrl)
             consumeAck("bm.issuesDiscordHook", Int::class) { _, issueId ->
-                transaction {
-                    modelPostgresOperation()
-                    Issue
-                        .join(IssueComment, JoinType.LEFT, Issue.id, IssueComment.issueId)
-                        .joinUser(Issue.creator)
-                        .selectAll()
-                        .where {
-                            (Issue.id eq issueId) and IssueComment.public
+                bmIssuesDiscordHookConsumerSlots.withPermit {
+                    transaction {
+                        modelPostgresOperation()
+                        Issue
+                            .join(IssueComment, JoinType.LEFT, Issue.id, IssueComment.issueId)
+                            .joinUser(Issue.creator)
+                            .selectAll()
+                            .where {
+                                (Issue.id eq issueId) and IssueComment.public
+                            }
+                            .orderBy(IssueComment.createdAt to SortOrder.ASC)
+                            .limit(1)
+                            .handleUser()
+                            .preHydrate(true)
+                            .singleOrNull()?.let { row ->
+                                IssueDetail.from(row, "") to IssueCommentDetail.from(row)
+                            }
+                    }?.let { (issue, comment) ->
+                        issueWebhookSlots.withPermit {
+                            handler.post(issue, comment)
                         }
-                        .orderBy(IssueComment.createdAt to SortOrder.ASC)
-                        .limit(1)
-                        .handleUser()
-                        .preHydrate(true)
-                        .singleOrNull()?.let { row ->
-                            IssueDetail.from(row, "") to IssueCommentDetail.from(row)
-                        }
-                }?.let { (issue, comment) ->
-                    issueWebhookSlots.withPermit {
-                        handler.post(issue, comment)
                     }
                 }
             }

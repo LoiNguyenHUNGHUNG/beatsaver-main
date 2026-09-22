@@ -26,9 +26,12 @@ import io.beatmaps.common.solr.collections.PlaylistSolr
 import io.beatmaps.common.solr.collections.UserSolr
 import io.beatmaps.common.solr.insert
 import io.beatmaps.common.solr.insertMany
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelSolrOperation
 import io.ktor.server.application.Application
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.toKotlinInstant
 import kotlinx.serialization.builtins.serializer
 import org.jetbrains.exposed.sql.Coalesce
@@ -43,6 +46,11 @@ import org.jetbrains.exposed.sql.not
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.lang.Integer.toHexString
+
+private val bmSolrConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val bmSolrUserConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val bmSolrUserInfoConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val bmSolrPlaylistConsumerSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 object SolrImporter {
     private fun trigger(updateMapId: Int) {
@@ -297,19 +305,27 @@ object SolrImporter {
     fun Application.solrUpdater() {
         rabbitOptional {
             consumeAck("bm.solr", Int.serializer()) { _, mapId ->
-                trigger(mapId)
+                bmSolrConsumerSlots.withPermit {
+                    trigger(mapId)
+                }
             }
 
             consumeAck("bm.solr-user", Int.serializer()) { _, userId ->
-                triggerUser(userId)
+                bmSolrUserConsumerSlots.withPermit {
+                    triggerUser(userId)
+                }
             }
 
             consumeAck("bm.solr-user-info", Int.serializer()) { _, userId ->
-                triggerUserInfo(userId)
+                bmSolrUserInfoConsumerSlots.withPermit {
+                    triggerUserInfo(userId)
+                }
             }
 
             consumeAck("bm.solr-playlist", Int.serializer()) { _, playlistId ->
-                triggerPlaylist(playlistId)
+                bmSolrPlaylistConsumerSlots.withPermit {
+                    triggerPlaylist(playlistId)
+                }
             }
         }
     }
