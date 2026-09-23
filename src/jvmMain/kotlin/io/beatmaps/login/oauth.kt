@@ -6,26 +6,32 @@ import io.beatmaps.common.Config
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.login.patreon.patreonProvider
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.formWithBandwidthEffect
+import io.beatmaps.util.installWithBandwidthEffect
 import io.beatmaps.util.modelPostgresOperation
+import io.github.loinguyen.bandwidth.annotations.Handler
 import io.ktor.client.HttpClient
 import io.ktor.server.application.Application
-import io.ktor.server.application.install
 import io.ktor.server.auth.Authentication
-import io.ktor.server.auth.form
 import io.ktor.server.auth.oauth
 import io.ktor.server.request.uri
 import io.ktor.server.response.respondRedirect
 import io.ktor.util.StringValues
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 
 class SimpleUserPrincipal(val user: UserDao, val alertCount: Int, val redirect: String)
 
+private val localAuthenticationSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun Application.installOauth(httpClient: HttpClient) {
     val discordHelper = DiscordHelper(httpClient)
 
-    install(Authentication) {
+    installWithBandwidthEffect(Authentication) {
         oauth("discord") {
             client = httpClient
             urlProvider = { "${Config.siteBase()}${request.uri.substringBefore("?")}" }
@@ -39,7 +45,7 @@ fun Application.installOauth(httpClient: HttpClient) {
             urlProvider = { "${Config.siteBase()}${request.uri.substringBefore("?")}" }
             providerLookup = { patreonProvider }
         }
-        form("auth-form") {
+        formWithBandwidthEffect("auth-form") {
             userParamName = "username"
             passwordParamName = "password"
             challenge {
@@ -49,24 +55,28 @@ fun Application.installOauth(httpClient: HttpClient) {
                     call.respondRedirect("/login?failed")
                 }
             }
-            validate { credentials ->
-                transaction {
-                    modelPostgresOperation()
-                    User.selectAll().where {
-                        if (credentials.name.contains('@')) {
-                            (User.email eq credentials.name) and User.discordId.isNull()
-                        } else {
-                            User.uniqueName eq credentials.name
-                        } and User.active
-                    }.firstOrNull()?.let {
-                        if (it[User.password]?.let { curPw -> Bcrypt.verify(credentials.password, curPw.toByteArray()) } == true) {
-                            SimpleUserPrincipal(UserDao.wrapRow(it), alertCount(it[User.id].value), request.uri)
-                        } else {
-                            null
+            validate(
+                @Handler { credentials ->
+                    localAuthenticationSlots.withPermit {
+                        transaction {
+                            modelPostgresOperation()
+                            User.selectAll().where {
+                                if (credentials.name.contains('@')) {
+                                    (User.email eq credentials.name) and User.discordId.isNull()
+                                } else {
+                                    User.uniqueName eq credentials.name
+                                } and User.active
+                            }.firstOrNull()?.let {
+                                if (it[User.password]?.let { curPw -> Bcrypt.verify(credentials.password, curPw.toByteArray()) } == true) {
+                                    SimpleUserPrincipal(UserDao.wrapRow(it), alertCount(it[User.id].value), request.uri)
+                                } else {
+                                    null
+                                }
+                            }
                         }
                     }
                 }
-            }
+            )
         }
     }
 }

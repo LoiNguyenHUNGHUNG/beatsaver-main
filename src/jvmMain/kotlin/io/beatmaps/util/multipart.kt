@@ -4,6 +4,7 @@ import io.beatmaps.cloudflare.CaptchaVerifier
 import io.beatmaps.common.json
 import io.beatmaps.controllers.UploadException
 import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
 import io.ktor.client.HttpClient
 import io.ktor.http.content.MultiPartData
 import io.ktor.http.content.PartData
@@ -24,46 +25,70 @@ data class MultipartRequest<U>(val dataMap: Map<String, JsonElement> = emptyMap(
 }
 
 @BandwidthEffect(rMaxBytesPerSecond = SMALL_RESPONSE_RATE_BYTES_PER_SECOND, nMax = 1)
-private suspend fun <U> handleMultipartInternal(data: MultiPartData, ctx: RoutingContext, client: HttpClient, cb: suspend (PartData.FileItem) -> U): MultipartRequest<U> {
-    val part = data.readPart()
+private suspend fun MultiPartData.readModeledPart() = readPart()
 
-    return if (part is PartData.FormItem) {
-        // Process recaptcha immediately as it is time-critical
-        if (part.name == "recaptcha") {
-            val recaptchaSuccess = ctx.captchaProvider { provider ->
-                val verifyResponse = withContext(Dispatchers.IO) {
-                    CaptchaVerifier.verify(client, provider, part.value, ctx.call.request.origin.remoteHost)
-                }
+@BandwidthVariable("Body")
+private suspend fun <U> handleMultipartInternal(
+    data: MultiPartData,
+    ctx: RoutingContext,
+    client: HttpClient,
+    @BandwidthEffect("Body") cb: suspend (PartData.FileItem) -> U
+): MultipartRequest<U> {
+    var dataMap = emptyMap<String, JsonElement>()
+    var recaptchaSuccess = false
+    var fileOutput: U? = null
+    var hasFileOutput = false
 
-                verifyResponse.success || throw UploadException("Could not verify user [${verifyResponse.errorCodes.joinToString(", ")}]")
-            }
+    while (true) {
+        when (val part = data.readModeledPart()) {
+            is PartData.FormItem -> {
+                // Process recaptcha immediately as it is time-critical
+                if (part.name == "recaptcha") {
+                    recaptchaSuccess = ctx.captchaProvider { provider ->
+                        val verifyResponse = withContext(Dispatchers.IO) {
+                            CaptchaVerifier.verify(client, provider, part.value, ctx.call.request.origin.remoteHost)
+                        }
 
-            handleMultipartInternal(data, ctx, client, cb)
-                .copy(recaptchaSuccess = recaptchaSuccess)
-        } else {
-            val newData = try {
-                if (part.value.startsWith("{") && part.value.endsWith("}")) {
-                    json.parseToJsonElement(part.value)
+                        verifyResponse.success || throw UploadException("Could not verify user [${verifyResponse.errorCodes.joinToString(", ")}]")
+                    }
                 } else {
-                    null
-                }
-            } catch (e: SerializationException) {
-                null
-            } ?: JsonPrimitive(part.value)
+                    val newData = try {
+                        if (part.value.startsWith("{") && part.value.endsWith("}")) {
+                            json.parseToJsonElement(part.value)
+                        } else {
+                            null
+                        }
+                    } catch (e: SerializationException) {
+                        null
+                    } ?: JsonPrimitive(part.value)
 
-            handleMultipartInternal(data, ctx, client, cb).let {
-                it.copy(dataMap = it.dataMap.plus(part.name.toString() to newData))
+                    // The recursive implementation kept the first value for a
+                    // repeated field name; preserve that behavior here.
+                    val partName = part.name.toString()
+                    if (partName !in dataMap) {
+                        dataMap = dataMap.plus(partName to newData)
+                    }
+                }
             }
+
+            is PartData.FileItem -> {
+                val output = cb(part)
+                if (!hasFileOutput) {
+                    fileOutput = output
+                    hasFileOutput = true
+                }
+            }
+
+            null -> return MultipartRequest(dataMap, recaptchaSuccess, fileOutput)
+            else -> Unit
         }
-    } else if (part is PartData.FileItem) {
-        val fileOutput = cb(part)
-        handleMultipartInternal(data, ctx, client, cb).copy(fileOutput = fileOutput)
-    } else if (part != null) {
-        handleMultipartInternal(data, ctx, client, cb)
-    } else {
-        MultipartRequest()
     }
 }
 
-suspend fun <U> RoutingContext.handleMultipart(client: HttpClient, limit: Long = -1L, cb: suspend (PartData.FileItem) -> U) =
+@BandwidthVariable("Body")
+suspend fun <U> RoutingContext.handleMultipart(
+    client: HttpClient,
+    limit: Long = -1L,
+    @BandwidthEffect("Body") cb: suspend (PartData.FileItem) -> U
+) =
     handleMultipartInternal(call.receiveMultipart(limit), this, client, cb)

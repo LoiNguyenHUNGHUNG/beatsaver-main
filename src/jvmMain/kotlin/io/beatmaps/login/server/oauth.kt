@@ -6,14 +6,18 @@ import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.genericPage
 import io.beatmaps.login.Session
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.installWithBandwidthEffect
 import io.beatmaps.util.modelPostgresOperation
+import io.github.loinguyen.bandwidth.annotations.Handler
 import io.ktor.http.HttpMethod
 import io.ktor.server.application.Application
-import io.ktor.server.application.install
 import io.ktor.server.request.httpMethod
 import io.ktor.server.sessions.get
 import io.ktor.server.sessions.sessions
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.html.meta
 import nl.myndocs.oauth2.authenticator.Credentials
 import nl.myndocs.oauth2.client.Client
@@ -31,22 +35,26 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import java.time.Instant
 import java.util.UUID
 
-fun Application.installOauth2(deviceCodeStore: InMemoryDeviceCodeStore) {
-    install(Oauth2ServerFeature) {
-        authenticationCallback = { call, callRouter ->
-            if (call.request.httpMethod == HttpMethod.Get) {
-                val userSession = call.sessions.get<Session>()
-                val reqClientId = call.parameters["client_id"]
+private val oauth2AuthenticationSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
-                if (reqClientId != null && userSession?.oauth2ClientId == reqClientId) {
-                    callRouter.route(BSCallContext(call), Credentials(userSession.userId.toString(), ""))
-                } else {
-                    runBlocking {
-                        call.genericPage(headerTemplate = {
-                            reqClientId?.let { DBClientService.getClient(it) }?.let { client ->
-                                meta("oauth-data", "{\"id\": \"${client.clientId}\", \"name\": \"${client.name}\", \"icon\": \"${client.iconUrl}\"}")
-                            }
-                        })
+fun Application.installOauth2(deviceCodeStore: InMemoryDeviceCodeStore) {
+    installWithBandwidthEffect(Oauth2ServerFeature) {
+        authenticationCallback = @Handler { call, callRouter ->
+            runBlocking {
+                oauth2AuthenticationSlots.withPermit {
+                    if (call.request.httpMethod == HttpMethod.Get) {
+                        val userSession = call.sessions.get<Session>()
+                        val reqClientId = call.parameters["client_id"]
+
+                        if (reqClientId != null && userSession?.oauth2ClientId == reqClientId) {
+                            callRouter.route(BSCallContext(call), Credentials(userSession.userId.toString(), ""))
+                        } else {
+                            call.genericPage(headerTemplate = {
+                                reqClientId?.let { DBClientService.getClient(it) }?.let { client ->
+                                    meta("oauth-data", "{\"id\": \"${client.clientId}\", \"name\": \"${client.name}\", \"icon\": \"${client.iconUrl}\"}")
+                                }
+                            })
+                        }
                     }
                 }
             }

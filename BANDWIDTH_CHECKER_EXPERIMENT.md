@@ -41,44 +41,62 @@ operation competes with timed transfers. PostgreSQL transactions contain no
 `launch`, `async`, or `coroutineScope` in the inspected source, so one
 transaction cannot issue parallel database operations in this model.
 
-The library pass deliberately does not yet model Ktor server responses or the
-RabbitMQ `consumeAck` registration itself. Those APIs need lifetime contracts
-before their effects can be stated soundly.
+Ktor server responses remain outside the model. RabbitMQ `consumeAck`
+callbacks are modeled as retained handlers, with one independent three-permit
+semaphore for each effectful consumer.
 
 The RabbitMQ publish model assumes that the transfer effect ends when
 `basicPublish` returns. The library makes that call synchronously, but it does
 not enable publisher confirms or wait for a broker acknowledgement. A stronger
 delivery-level guarantee would therefore require a different contract.
 
-## HTTP-only baseline result
+## Results
 
-With three permits per network-bearing handler, the checker reports:
+The original HTTP-only pass reported:
 
 ```text
 Inferred application entry-point effect from 1 entry point(s): {(400000/3, 79)}
 ReqBW=31600000/3 bytes/s
 ```
 
-That is approximately 10.53 MB/s (84.3 Mb/s). It is a conservative peak-demand
-result: the effect representation raises all 79 possible concurrent downloads
-to the largest configured per-download rate (8 MB / 60 seconds).
+That is approximately 10.53 MB/s (84.3 Mb/s). This value is retained as a
+baseline only; it excludes the later library-boundary models.
 
 The library-boundary pass exposed 109 additional effectful HTTP handlers. Each
 now has its own immutable top-level three-permit semaphore, held for the entire
 handler body. This removes all HTTP-handler repetition diagnostics. The 16
 effectful RabbitMQ `consumeAck` callbacks likewise have independent immutable
-top-level three-permit semaphores held across their complete bodies. Compilation
-now intentionally stops on 15 diagnostics rather than silently assuming a
-bound:
+top-level three-permit semaphores held across their complete bodies.
 
-- 15 higher-order calls need effect forwarding or a calls-in-place model. These
-  include `requireCaptcha`, `captchaIfPresent`, Ktor `install` and authentication
-  configuration, `genericPage`, `use`, and two function references passed to
-  `map`.
+Effect-polymorphic contracts now preserve callback effects through BeatSaver's
+authorization, CAPTCHA, multipart, page-template, and Ktor configuration
+helpers. Ktor plugin configuration blocks are invoked once. Authentication
+callbacks retained by Ktor or the OAuth library are marked as handlers and
+execute under three-permit semaphores. The multipart reader was changed from
+recursion to an equivalent loop so its callback effect remains visible without
+requiring a concrete recursive summary.
 
-Consequently, 10.53 MB/s remains the earlier HTTP-only baseline, not a current
-whole-server guarantee. A new application bound should be recorded only after
-the remaining callbacks receive sound runtime or checker-level bounds.
+With these source-visible callbacks modeled, a fresh full compilation reports:
+
+```text
+Inferred application entry-point effect from 1 entry point(s): {(400000/3, 427)}
+ReqBW=170800000/3 bytes/s
+```
+
+That is approximately 56.93 MB/s (455.5 Mb/s). It is a conservative
+peak-demand result: the effect representation raises all 427 possibly
+concurrent operations to the largest configured per-operation rate (8 MB / 60
+seconds). Operations with no whole-call timeout contribute a zero rate but
+still increase the concurrency component because they compete with timed
+transfers.
+
+This is the result for the experiment's explicit source-level contracts, not a
+production capacity recommendation. Calls that opaque frameworks later make
+through registered service interfaces—such as Ktor Sessions invoking
+`MongoSessionStorage`, or the OAuth library invoking `ClientService`,
+`TokenStore`, and `IdentityService`—still require separate framework contracts
+before this can be called a complete model of every library-controlled network
+operation.
 
 ## Reproduce
 
