@@ -2,10 +2,10 @@ package io.beatmaps.login
 
 import com.mongodb.client.MongoCollection
 import com.mongodb.client.model.ReplaceOptions
+import io.beatmaps.util.installWithBandwidthEffect
 import io.beatmaps.util.modelMongoOperation
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
-import io.ktor.server.application.install
 import io.ktor.server.sessions.CookieConfiguration
 import io.ktor.server.sessions.SessionProvider
 import io.ktor.server.sessions.SessionStorageMemory
@@ -100,7 +100,7 @@ fun ApplicationCall.bmSessionId() = application.attributes[BMSessionProvidersKey
 }
 
 fun Application.installSessions() {
-    install(Sessions) {
+    installWithBandwidthEffect(Sessions) {
         val sessionType = Session::class
         val cookieConfig = CookieConfiguration().apply {
             extensions["SameSite"] = "lax"

@@ -7,6 +7,8 @@ import io.beatmaps.cloudflare.SiteVerifyResponse
 import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.login.Session
 import io.beatmaps.login.server.DBTokenStore
+import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
 import io.ktor.client.HttpClient
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.auth.HttpAuthHeader
@@ -29,7 +31,11 @@ enum class AuthType {
 private fun sessionFromToken(token: AccessToken) = (token.identity?.metadata?.get("object") as? UserDao)
     ?.let { Session.fromUser(it, oauth2ClientId = token.clientId) }
 
-suspend fun <T> ApplicationCall.optionalAuthorization(scope: OauthScope? = null, block: suspend ApplicationCall.(AuthType, Session?) -> T) {
+@BandwidthVariable("Body")
+suspend fun <T> ApplicationCall.optionalAuthorization(
+    scope: OauthScope? = null,
+    @BandwidthEffect("Body") block: suspend ApplicationCall.(AuthType, Session?) -> T
+) {
     // Oauth
     checkOauthHeader(scope)?.let(::sessionFromToken)?.also { block(AuthType.Oauth, it) }
         // Session
@@ -38,14 +44,22 @@ suspend fun <T> ApplicationCall.optionalAuthorization(scope: OauthScope? = null,
         ?: run { block(AuthType.None, null) }
 }
 
-suspend fun <T> RoutingContext.optionalAuthorization(scope: OauthScope? = null, block: suspend RoutingContext.(AuthType, Session?) -> T) {
+@BandwidthVariable("Body")
+suspend fun <T> RoutingContext.optionalAuthorization(
+    scope: OauthScope? = null,
+    @BandwidthEffect("Body") block: suspend RoutingContext.(AuthType, Session?) -> T
+) {
     val that = this
     call.optionalAuthorization(scope) { a, b ->
         block(that, a, b)
     }
 }
 
-suspend fun <T> RoutingContext.requireAuthorization(scope: OauthScope? = null, block: suspend RoutingContext.(AuthType, Session) -> T) {
+@BandwidthVariable("Body")
+suspend fun <T> RoutingContext.requireAuthorization(
+    scope: OauthScope? = null,
+    @BandwidthEffect("Body") block: suspend RoutingContext.(AuthType, Session) -> T
+) {
     optionalAuthorization(scope) { type, sess ->
         if (type == AuthType.None || sess == null) {
             call.respond(HttpStatusCode.Unauthorized, "Unauthorized")
@@ -72,9 +86,18 @@ fun ApplicationCall.checkOauthHeader(scope: OauthScope? = null) =
         } else { null }
     }
 
-suspend fun <T> RoutingContext.captchaProvider(block: suspend (CaptchaProvider) -> T): T = block(CaptchaVerifier.provider(call))
+@BandwidthVariable("Body")
+suspend fun <T> RoutingContext.captchaProvider(
+    @BandwidthEffect("Body") block: suspend (CaptchaProvider) -> T
+): T = block(CaptchaVerifier.provider(call))
 
-suspend fun <T> RoutingContext.requireCaptcha(client: HttpClient, captcha: String?, block: suspend RoutingContext.() -> T, error: (suspend RoutingContext.(SiteVerifyResponse) -> T)? = null) =
+@BandwidthVariable("Body", "Error")
+suspend fun <T> RoutingContext.requireCaptcha(
+    client: HttpClient,
+    captcha: String?,
+    @BandwidthEffect("Body") block: suspend RoutingContext.() -> T,
+    @BandwidthEffect("Error") error: (suspend RoutingContext.(SiteVerifyResponse) -> T)? = null
+) =
     captchaProvider { provider ->
         withContext(Dispatchers.IO) {
             CaptchaVerifier.verify(client, provider, captcha ?: "", call.request.origin.remoteHost)
@@ -87,7 +110,12 @@ suspend fun <T> RoutingContext.requireCaptcha(client: HttpClient, captcha: Strin
         }
     }
 
-suspend fun <T> RoutingContext.captchaIfPresent(client: HttpClient, captcha: String?, block: suspend RoutingContext.() -> T) =
+@BandwidthVariable("Body")
+suspend fun <T> RoutingContext.captchaIfPresent(
+    client: HttpClient,
+    captcha: String?,
+    @BandwidthEffect("Body") block: suspend RoutingContext.() -> T
+) =
     if (captcha != null) {
         this.requireCaptcha(client, captcha, block)
     } else {

@@ -70,6 +70,8 @@ import io.beatmaps.util.downloadsThread
 import io.beatmaps.util.playlistStats
 import io.beatmaps.util.reviewListeners
 import io.beatmaps.websockets.mapUpdateEnricher
+import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
 import io.github.loinguyen.bandwidth.annotations.EntryPoint
 import io.ktor.client.HttpClient
 import io.ktor.http.ContentType
@@ -126,7 +128,11 @@ import java.util.logging.Logger
 import javax.sql.DataSource
 import kotlin.time.Duration.Companion.nanoseconds
 
-suspend fun RoutingContext.genericPage(statusCode: HttpStatusCode = HttpStatusCode.OK, headerTemplate: (HEAD.() -> Unit)? = null) =
+@BandwidthVariable("Header")
+suspend fun RoutingContext.genericPage(
+    statusCode: HttpStatusCode = HttpStatusCode.OK,
+    @BandwidthEffect("Header") headerTemplate: (HEAD.() -> Unit)? = null
+) =
     call.genericPage(statusCode, headerTemplate)
 
 fun ApplicationCall.getNonce() =
@@ -140,7 +146,12 @@ val dockerHash = File("/etc/hostname").let {
     }
 }
 
-suspend fun ApplicationCall.genericPage(statusCode: HttpStatusCode = HttpStatusCode.OK, headerTemplate: (HEAD.() -> Unit)? = null, includeHeader: Boolean = true) {
+@BandwidthVariable("Header")
+suspend fun ApplicationCall.genericPage(
+    statusCode: HttpStatusCode = HttpStatusCode.OK,
+    @BandwidthEffect("Header") headerTemplate: (HEAD.() -> Unit)? = null,
+    includeHeader: Boolean = true
+) {
     val sess = sessions.get<Session>()
     val nonce = getNonce()
     val provider = CaptchaVerifier.provider(this)
@@ -161,7 +172,11 @@ suspend fun ApplicationCall.genericPage(statusCode: HttpStatusCode = HttpStatusC
     }
 }
 
-suspend fun RoutingContext.emptyPage(statusCode: HttpStatusCode = HttpStatusCode.OK, headerTemplate: (HEAD.() -> Unit)? = null) =
+@BandwidthVariable("Header")
+suspend fun RoutingContext.emptyPage(
+    statusCode: HttpStatusCode = HttpStatusCode.OK,
+    @BandwidthEffect("Header") headerTemplate: (HEAD.() -> Unit)? = null
+) =
     call.genericPage(statusCode, headerTemplate, false)
 
 enum class DbMigrationType(val folder: String) {
