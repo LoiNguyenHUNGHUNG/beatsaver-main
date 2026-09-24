@@ -7,7 +7,12 @@ import io.beatmaps.common.dbo.OauthClientDao
 import io.beatmaps.common.dbo.RefreshTokenTable
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.modelPostgresOperation
+import io.github.loinguyen.bandwidth.annotations.Handler
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import nl.myndocs.oauth2.identity.Identity
 import nl.myndocs.oauth2.identity.TokenInfo
 import nl.myndocs.oauth2.token.AccessToken
@@ -22,28 +27,41 @@ import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 
+private val accessTokenSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val refreshTokenSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val revokeAccessTokenSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val revokeRefreshTokenSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val storeAccessTokenSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val storeRefreshTokenSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val tokenInfoSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun UserDao.toIdentity() =
     Identity(id.value.toString(), mapOf("object" to this))
 
 object DBTokenStore : TokenStore {
     private val codes = mutableMapOf<String, CodeToken>()
 
+    @Handler
     override fun accessToken(token: String) =
-        transaction {
-            modelPostgresOperation()
-            AccessTokenTable
-                .join(RefreshTokenTable, JoinType.INNER, AccessTokenTable.refreshToken, RefreshTokenTable.id)
-                .join(OauthClient, JoinType.INNER, AccessTokenTable.clientId, OauthClient.clientId)
-                .join(User, JoinType.INNER, AccessTokenTable.userName, User.id)
-                .selectAll()
-                .where {
-                    AccessTokenTable.id eq token
-                }
-                .singleOrNull()?.let {
-                    OauthClientDao.wrapRow(it)
+        runBlocking {
+            accessTokenSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    AccessTokenTable
+                        .join(RefreshTokenTable, JoinType.INNER, AccessTokenTable.refreshToken, RefreshTokenTable.id)
+                        .join(OauthClient, JoinType.INNER, AccessTokenTable.clientId, OauthClient.clientId)
+                        .join(User, JoinType.INNER, AccessTokenTable.userName, User.id)
+                        .selectAll()
+                        .where {
+                            AccessTokenTable.id eq token
+                        }
+                        .singleOrNull()?.let {
+                            OauthClientDao.wrapRow(it)
 
-                    accessTokenFromResult(it)
+                            accessTokenFromResult(it)
+                        }
                 }
+            }
         }
 
     private fun accessTokenFromResult(row: ResultRow) =
@@ -69,17 +87,22 @@ object DBTokenStore : TokenStore {
 
     override fun consumeCodeToken(token: String): CodeToken? = codes.remove(token)
 
+    @Handler
     override fun refreshToken(token: String) =
-        transaction {
-            modelPostgresOperation()
-            RefreshTokenTable
-                .join(User, JoinType.INNER, RefreshTokenTable.userName, User.id)
-                .selectAll()
-                .where {
-                    RefreshTokenTable.id eq token
-                }.singleOrNull()?.let {
-                    refreshToken(it)
+        runBlocking {
+            refreshTokenSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    RefreshTokenTable
+                        .join(User, JoinType.INNER, RefreshTokenTable.userName, User.id)
+                        .selectAll()
+                        .where {
+                            RefreshTokenTable.id eq token
+                        }.singleOrNull()?.let {
+                            refreshToken(it)
+                        }
                 }
+            }
         }
 
     private fun refreshToken(row: ResultRow) = RefreshToken(
@@ -90,39 +113,54 @@ object DBTokenStore : TokenStore {
         row[RefreshTokenTable.scope].split(",").toSet()
     )
 
+    @Handler
     override fun revokeAccessToken(token: String) {
-        transaction {
-            modelPostgresOperation()
-            AccessTokenTable.deleteWhere {
-                id eq token
+        runBlocking {
+            revokeAccessTokenSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    AccessTokenTable.deleteWhere {
+                        id eq token
+                    }
+                }
             }
         }
     }
 
+    @Handler
     override fun revokeRefreshToken(token: String) {
-        transaction {
-            modelPostgresOperation()
-            RefreshTokenTable.deleteWhere {
-                id eq token
+        runBlocking {
+            revokeRefreshTokenSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    RefreshTokenTable.deleteWhere {
+                        id eq token
+                    }
+                }
             }
         }
     }
 
+    @Handler
     override fun storeAccessToken(accessToken: AccessToken) {
-        transaction {
-            modelPostgresOperation()
-            AccessTokenTable.insert {
-                it[id] = accessToken.accessToken
-                it[type] = accessToken.tokenType
-                it[expiration] = accessToken.expireTime
-                it[scope] = accessToken.scopes.joinToString(",")
-                it[userName] = accessToken.identity?.username?.toIntOrNull()
-                it[clientId] = accessToken.clientId
-                it[refreshToken] = accessToken.refreshToken?.refreshToken
-            }
+        runBlocking {
+            storeAccessTokenSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    AccessTokenTable.insert {
+                        it[id] = accessToken.accessToken
+                        it[type] = accessToken.tokenType
+                        it[expiration] = accessToken.expireTime
+                        it[scope] = accessToken.scopes.joinToString(",")
+                        it[userName] = accessToken.identity?.username?.toIntOrNull()
+                        it[clientId] = accessToken.clientId
+                        it[refreshToken] = accessToken.refreshToken?.refreshToken
+                    }
 
-            if (accessToken.refreshToken != null) {
-                storeRefreshToken(accessToken.refreshToken!!)
+                    if (accessToken.refreshToken != null) {
+                        storeRefreshTokenLocal(accessToken.refreshToken!!)
+                    }
+                }
             }
         }
     }
@@ -133,7 +171,16 @@ object DBTokenStore : TokenStore {
         codes[codeToken.codeToken] = codeToken
     }
 
+    @Handler
     override fun storeRefreshToken(refreshToken: RefreshToken) {
+        runBlocking {
+            storeRefreshTokenSlots.withPermit {
+                storeRefreshTokenLocal(refreshToken)
+            }
+        }
+    }
+
+    private fun storeRefreshTokenLocal(refreshToken: RefreshToken) {
         transaction {
             modelPostgresOperation()
             RefreshTokenTable.upsert(RefreshTokenTable.id) {
@@ -146,26 +193,31 @@ object DBTokenStore : TokenStore {
         }
     }
 
+    @Handler
     override fun tokenInfo(token: String) =
-        transaction {
-            modelPostgresOperation()
-            AccessTokenTable
-                .join(RefreshTokenTable, JoinType.INNER, AccessTokenTable.refreshToken, RefreshTokenTable.id)
-                .join(OauthClient, JoinType.INNER, AccessTokenTable.clientId, OauthClient.clientId)
-                .join(User, JoinType.INNER, AccessTokenTable.userName, User.id)
-                .selectAll()
-                .where {
-                    AccessTokenTable.id eq token
-                }
-                .singleOrNull()?.let {
-                    val accessToken = accessTokenFromResult(it)
+        runBlocking {
+            tokenInfoSlots.withPermit {
+                transaction {
+                    modelPostgresOperation()
+                    AccessTokenTable
+                        .join(RefreshTokenTable, JoinType.INNER, AccessTokenTable.refreshToken, RefreshTokenTable.id)
+                        .join(OauthClient, JoinType.INNER, AccessTokenTable.clientId, OauthClient.clientId)
+                        .join(User, JoinType.INNER, AccessTokenTable.userName, User.id)
+                        .selectAll()
+                        .where {
+                            AccessTokenTable.id eq token
+                        }
+                        .singleOrNull()?.let {
+                            val accessToken = accessTokenFromResult(it)
 
-                    TokenInfo(
-                        accessToken.identity,
-                        DBClientService.convertToClient(OauthClientDao.wrapRow(it)),
-                        accessToken.scopes
-                    )
+                            TokenInfo(
+                                accessToken.identity,
+                                DBClientService.convertToClient(OauthClientDao.wrapRow(it)),
+                                accessToken.scopes
+                            )
+                        }
                 }
+            }
         }
 
     fun deleteForUser(userId: Int) {

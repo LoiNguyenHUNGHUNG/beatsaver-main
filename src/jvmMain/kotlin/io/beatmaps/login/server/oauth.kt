@@ -36,6 +36,7 @@ import java.time.Instant
 import java.util.UUID
 
 private val oauth2AuthenticationSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val identityValidCredentialsSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 fun Application.installOauth2(deviceCodeStore: InMemoryDeviceCodeStore) {
     installWithBandwidthEffect(Oauth2ServerFeature) {
@@ -90,10 +91,17 @@ fun Application.installOauth2(deviceCodeStore: InMemoryDeviceCodeStore) {
 
             override fun identityOf(forClient: Client, username: String) = Identity(username)
 
+            @Handler
             override fun validCredentials(forClient: Client, identity: Identity, password: String) =
-                transaction {
-                    modelPostgresOperation()
-                    !User.selectAll().where { (User.id eq identity.username.toInt()) and User.active }.empty()
+                runBlocking {
+                    identityValidCredentialsSlots.withPermit {
+                        transaction {
+                            modelPostgresOperation()
+                            !User.selectAll().where {
+                                (User.id eq identity.username.toInt()) and User.active
+                            }.empty()
+                        }
+                    }
                 }
         }
 

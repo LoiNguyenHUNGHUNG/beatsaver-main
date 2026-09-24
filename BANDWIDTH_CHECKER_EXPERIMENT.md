@@ -76,27 +76,34 @@ execute under three-permit semaphores. The multipart reader was changed from
 recursion to an equivalent loop so its callback effect remains visible without
 requiring a concrete recursive summary.
 
-With these source-visible callbacks modeled, a fresh full compilation reports:
+Declaration-level handler contracts model the network-bearing service methods
+that opaque frameworks invoke after registration. This covers three MongoDB
+session-storage methods, three OAuth client-service methods, seven OAuth
+token-store methods, and one identity-service method. Each method has its own
+three-permit runtime semaphore. The checker treats every declaration-level
+handler as an independent, repeatedly invocable application root while keeping
+an ordinary direct call to that method local to its caller.
+
+With these callbacks modeled, a fresh full compilation reports:
 
 ```text
-Inferred application entry-point effect from 1 entry point(s): {(400000/3, 427)}
-ReqBW=170800000/3 bytes/s
+Inferred application entry-point effect from 15 entry point(s): {(400000/3, 469)}
+ReqBW=187600000/3 bytes/s
 ```
 
-That is approximately 56.93 MB/s (455.5 Mb/s). It is a conservative
-peak-demand result: the effect representation raises all 427 possibly
+That is approximately 62.53 MB/s (500.3 Mb/s). It is a conservative
+peak-demand result: the effect representation raises all 469 possibly
 concurrent operations to the largest configured per-operation rate (8 MB / 60
 seconds). Operations with no whole-call timeout contribute a zero rate but
 still increase the concurrency component because they compete with timed
 transfers.
 
 This is the result for the experiment's explicit source-level contracts, not a
-production capacity recommendation. Calls that opaque frameworks later make
-through registered service interfaces—such as Ktor Sessions invoking
-`MongoSessionStorage`, or the OAuth library invoking `ClientService`,
-`TokenStore`, and `IdentityService`—still require separate framework contracts
-before this can be called a complete model of every library-controlled network
-operation.
+production capacity recommendation. The fourteen new handler roots account for
+42 additional possible operations because each handler has three permits. This
+closes the previously identified gaps for Ktor Sessions and the OAuth
+`ClientService`, `TokenStore`, and `IdentityService` interfaces; adding another
+opaque framework would still require a contract for its retained callbacks.
 
 ## Reproduce
 

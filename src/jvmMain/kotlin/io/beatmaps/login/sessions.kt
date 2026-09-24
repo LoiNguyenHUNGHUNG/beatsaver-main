@@ -2,8 +2,10 @@ package io.beatmaps.login
 
 import com.mongodb.client.MongoCollection
 import com.mongodb.client.model.ReplaceOptions
+import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.installWithBandwidthEffect
 import io.beatmaps.util.modelMongoOperation
+import io.github.loinguyen.bandwidth.annotations.Handler
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.sessions.CookieConfiguration
@@ -16,6 +18,8 @@ import io.ktor.server.sessions.defaultSessionSerializer
 import io.ktor.server.sessions.generateSessionId
 import io.ktor.server.sessions.sessionId
 import io.ktor.util.AttributeKey
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.serialization.Contextual
@@ -92,6 +96,10 @@ object MongoClient {
 }
 
 val BMSessionProvidersKey = AttributeKey<SessionProvider<*>>("BMSessionProvidersKey")
+private val mongoSessionReadSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mongoSessionWriteSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+private val mongoSessionInvalidateSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
+
 fun ApplicationCall.bmSessionId() = application.attributes[BMSessionProvidersKey].let { provider ->
     when (val tracker = provider.tracker) {
         is TypedSessionTracker<*> -> attributes.getOrNull(tracker.sessionIdKey)
@@ -126,12 +134,18 @@ fun Application.installSessions() {
 }
 
 class MongoSessionStorage(private val collection: MongoCollection<MongoSession>) : TypedSessionStorage<Session> {
-    override suspend fun read(id: String): Session {
-        modelMongoOperation()
-        return collection.findOne(MongoSession::id eq id)?.session ?: throw NoSuchElementException()
-    }
+    @Handler
+    override suspend fun read(id: String): Session =
+        mongoSessionReadSlots.withPermit {
+            modelMongoOperation()
+            collection.findOne(MongoSession::id eq id)?.session ?: throw NoSuchElementException()
+        }
 
-    override suspend fun write(id: String, value: Session) = writeLocal(id, value)
+    @Handler
+    override suspend fun write(id: String, value: Session) =
+        mongoSessionWriteSlots.withPermit {
+            writeLocal(id, value)
+        }
 
     private fun writeLocal(id: String, value: Session, ttl: Long = 7 * 24 * 3600L) {
         modelMongoOperation()
@@ -142,10 +156,13 @@ class MongoSessionStorage(private val collection: MongoCollection<MongoSession>)
         )
     }
 
-    override suspend fun invalidate(id: String) {
-        modelMongoOperation()
-        collection.deleteOne(
-            MongoSession::id eq id
-        )
-    }
+    @Handler
+    override suspend fun invalidate(id: String) =
+        mongoSessionInvalidateSlots.withPermit {
+            modelMongoOperation()
+            collection.deleteOne(
+                MongoSession::id eq id
+            )
+            Unit
+        }
 }
