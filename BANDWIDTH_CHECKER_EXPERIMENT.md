@@ -12,13 +12,50 @@ It is an experiment, not a production capacity recommendation.
   three permits. The gates are deliberately not shared between handlers, so the
   inferred application bound is the parallel composition of their individual
   bounds.
-- Small JSON/API responses are assumed to be at most 1 MB and use a 20-second
+- Profiled score responses are assumed to be at most 7 KiB and use a 20-second
   complete-request timeout.
-- Image responses are assumed to be at most 8 MB and use a 60-second
-  complete-request timeout.
+- Other small JSON/API responses are assumed to be at most 16 KiB and use a
+  20-second complete-request timeout. This is a separate assumption for the
+  authenticated services that could not be profiled without credentials.
+- The playlist-avatar path is exercised with BeatSaver account `58338`
+  (`Joetastic`) and its fixed 26,482-byte avatar response.
+- The Discord-avatar path is exercised directly with public fixture account
+  `500064999524401152` (`feroxf`) and its fixed 40,234-byte avatar response.
+  Both avatar paths use a 60-second complete-request timeout.
 - The experiment workload must not return responses larger than those bounds.
   The constants live in `BandwidthExperiment.kt` so another experimental
   configuration can change them in one place.
+- Inbound request bodies, including multipart uploads, are outside the property
+  and do not contribute a download effect.
+
+### Small-workload profile
+
+The response ceilings above come from a September 23, 2026 profiling run that
+kept pagination and media inputs small. It made requests directly to the same
+public upstream endpoints used by BeatSaver, without changing server logic.
+
+| Response class | Samples | Largest observed body | Experimental ceiling |
+|---|---:|---:|---:|
+| ScoreSaber leaderboard responses | 10 selected hashes (8 successful score pages) | 6,894 B | 7 KiB |
+| BeatLeader first page (`count=12`) | 10 popular-map hashes | 2,591 B | 7 KiB |
+| BeatSaver playlist avatar | Joetastic (`id=58338`) | 26,482 B | 26,482 B |
+| Discord avatar | feroxf (`id=500064999524401152`) | 40,234 B | 40,234 B |
+
+The avatar ceilings describe only these exact fixtures, not universal API
+limits. Profiling and runtime execution must use the same URLs and reject a
+response whose body no longer matches the recorded size:
+
+```text
+https://cdn.beatsaver.com/avatar/91bb7b0510cea647179bc95e032f8a25608b09f1.png
+https://cdn.discordapp.com/avatars/500064999524401152/26353295679abfb6d36c20ba18695bdb.png
+```
+
+CAPTCHA, OAuth, Steam, Cloudflare, and webhook
+responses require credentials for successful end-to-end profiling; their 16 KiB
+ceiling is therefore an explicit workload assumption based on the small response
+shapes consumed by BeatSaver rather than an empirical maximum. These unprofiled
+responses retain their separate 16 KiB ceiling instead of inheriting the score
+ceiling.
 
 The annotations cover outbound Ktor HTTP calls reachable from the entry point,
 including CAPTCHA verification, OAuth identity calls, score services,
@@ -84,19 +121,30 @@ three-permit runtime semaphore. The checker treats every declaration-level
 handler as an independent, repeatedly invocable application root while keeping
 an ordinary direct call to that method local to its caller.
 
-With these callbacks modeled, a fresh full compilation reports:
+Before payload profiling, the deliberately broad 1 MB/8 MB ceilings produced:
 
 ```text
 Inferred application entry-point effect from 15 entry point(s): {(400000/3, 469)}
 ReqBW=187600000/3 bytes/s
 ```
 
-That is approximately 62.53 MB/s (500.3 Mb/s). It is a conservative
+That is approximately 62.53 MB/s (500.3 Mb/s). After replacing those guessed
+ceilings with the 7 KiB score and fixed-avatar profiles, retaining a separate
+16 KiB assumption for unprofiled API responses, and excluding inbound multipart
+reads, a fresh full compilation reports:
+
+```text
+Inferred application entry-point effect from 15 entry point(s): {(4096/5, 469)}
+ReqBW=1921024/5 bytes/s
+```
+
+That is approximately 0.384 MB/s (3.07 Mb/s). It remains a conservative
 peak-demand result: the effect representation raises all 469 possibly
-concurrent operations to the largest configured per-operation rate (8 MB / 60
-seconds). Operations with no whole-call timeout contribute a zero rate but
-still increase the concurrency component because they compete with timed
-transfers.
+concurrent operations to the largest configured per-operation rate. That rate
+currently comes from the separate 16 KiB / 20 second assumption for unprofiled
+small API responses, not either avatar fixture. Operations with no whole-call
+timeout contribute a zero rate but still increase the concurrency component
+because they compete with timed transfers.
 
 This is the result for the experiment's explicit source-level contracts, not a
 production capacity recommendation. The fourteen new handler roots account for

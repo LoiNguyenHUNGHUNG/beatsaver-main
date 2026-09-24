@@ -11,8 +11,8 @@ import io.beatmaps.common.db.upsert
 import io.beatmaps.common.dbo.Beatmap
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
+import io.beatmaps.util.DISCORD_AVATAR_MAX_BYTES
 import io.beatmaps.util.IMAGE_REQUEST_TIMEOUT_MILLIS
-import io.beatmaps.util.IMAGE_RESPONSE_MAX_BYTES
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
 import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
 import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
@@ -86,7 +86,7 @@ class DiscordHelper(val client: HttpClient) {
     )
 
     @NetworkDownload(
-        maxBytes = IMAGE_RESPONSE_MAX_BYTES,
+        maxBytes = DISCORD_AVATAR_MAX_BYTES,
         completeTimeoutMillis = IMAGE_REQUEST_TIMEOUT_MILLIS
     )
     suspend fun getDiscordAvatar(discordAvatar: String, discordId: Long) =

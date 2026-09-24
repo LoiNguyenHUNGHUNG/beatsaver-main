@@ -5,7 +5,7 @@ import io.beatmaps.api.LeaderboardScore
 import io.beatmaps.common.api.EDifficulty
 import io.beatmaps.common.beatsaber.leaderboard.SSGameMode
 import io.beatmaps.util.OUTBOUND_REQUEST_TIMEOUT_MILLIS
-import io.beatmaps.util.SMALL_RESPONSE_MAX_BYTES
+import io.beatmaps.util.SCORE_RESPONSE_MAX_BYTES
 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
@@ -18,7 +18,7 @@ import kotlinx.serialization.Serializable
 
 class ScoreSaberScores(private val client: HttpClient) : RemoteScores {
     @NetworkDownload(
-        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        maxBytes = SCORE_RESPONSE_MAX_BYTES,
         completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
     )
     private suspend fun getLeaderboardInfo(hash: String, diff: EDifficulty = EDifficulty.ExpertPlus, mode: SSGameMode = SSGameMode.SoloStandard) =
@@ -32,7 +32,7 @@ class ScoreSaberScores(private val client: HttpClient) : RemoteScores {
         }
 
     @NetworkDownload(
-        maxBytes = SMALL_RESPONSE_MAX_BYTES,
+        maxBytes = SCORE_RESPONSE_MAX_BYTES,
         completeTimeoutMillis = OUTBOUND_REQUEST_TIMEOUT_MILLIS
     )
     private suspend fun getScores(hash: String, diff: EDifficulty = EDifficulty.ExpertPlus, mode: SSGameMode = SSGameMode.SoloStandard, page: Int = 1) =

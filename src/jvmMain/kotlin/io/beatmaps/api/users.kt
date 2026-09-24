@@ -79,8 +79,8 @@ import io.beatmaps.login.Session
 import io.beatmaps.login.cookieName
 import io.beatmaps.login.server.DBTokenStore
 import io.beatmaps.util.IMAGE_REQUEST_TIMEOUT_MILLIS
-import io.beatmaps.util.IMAGE_RESPONSE_MAX_BYTES
 import io.beatmaps.util.NETWORK_HANDLER_CONCURRENCY
+import io.beatmaps.util.PLAYLIST_AVATAR_MAX_BYTES
 import io.beatmaps.util.modelMongoOperation
 import io.beatmaps.util.modelPostgresOperation
 import io.beatmaps.util.modelRabbitMqOperation
@@ -519,7 +519,7 @@ private val forgotPasswordSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 private val emailChangeSlots = Semaphore(NETWORK_HANDLER_CONCURRENCY)
 
 @NetworkDownload(
-    maxBytes = IMAGE_RESPONSE_MAX_BYTES,
+    maxBytes = PLAYLIST_AVATAR_MAX_BYTES,
     completeTimeoutMillis = IMAGE_REQUEST_TIMEOUT_MILLIS
 )
 private suspend fun downloadPlaylistAvatar(client: HttpClient, url: String) =
