@@ -24,9 +24,6 @@ data class MultipartRequest<U>(val dataMap: Map<String, JsonElement> = emptyMap(
     fun validRecaptcha(authType: AuthType) = authType == AuthType.Oauth || recaptchaSuccess
 }
 
-@BandwidthEffect(rMaxBytesPerSecond = SMALL_RESPONSE_RATE_BYTES_PER_SECOND, nMax = 1)
-private suspend fun MultiPartData.readModeledPart() = readPart()
-
 @BandwidthVariable("Body")
 private suspend fun <U> handleMultipartInternal(
     data: MultiPartData,
@@ -40,7 +37,9 @@ private suspend fun <U> handleMultipartInternal(
     var hasFileOutput = false
 
     while (true) {
-        when (val part = data.readModeledPart()) {
+        // Request-body reads are inbound traffic and are outside this experiment's
+        // outbound-bandwidth property.
+        when (val part = data.readPart()) {
             is PartData.FormItem -> {
                 // Process recaptcha immediately as it is time-critical
                 if (part.name == "recaptcha") {
